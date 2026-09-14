@@ -96,9 +96,9 @@ pub(crate) struct AcrClient {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DockerRegistryCredentials {
-    username: String,
-    password: String,
+pub(crate) struct DockerRegistryCredentials {
+    pub(crate) username: String,
+    pub(crate) password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -778,7 +778,7 @@ fn validate_https_url(
     }
 }
 
-fn load_docker_credentials(
+pub(crate) fn load_docker_credentials(
     registry: &str,
 ) -> Result<Option<DockerRegistryCredentials>, AcrClientError> {
     for path in docker_config_candidates() {

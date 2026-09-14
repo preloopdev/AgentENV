@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -34,7 +34,9 @@ use crate::cfg::{AppConfig, ResolvedImageCacheConfig};
 use crate::digest::FileDigest;
 use crate::image::commit_index::{self, CommitIndex};
 use crate::image::local_layer::LocalLayer;
-use crate::image::oci_image::{ConvertedLayerP2pMetadata, ImageConversion, LayerConversionKey};
+use crate::image::oci_image::{
+    ConvertedLayerP2pMetadata, ImageConversion, LayerConversionKey, OciBlobLocks,
+};
 use crate::image::ImageResolutionMetadata;
 use crate::local_store::LocalStoreDurability;
 use crate::p2p::{
@@ -45,6 +47,7 @@ const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
 const IMAGE_CACHE_METADATA_DIR: &str = "metadata";
 const IMAGE_CACHE_STAGING_DIR: &str = "staging";
+const OCI_BLOB_CACHE_DIR: &str = "oci-blobs";
 const RUNTIME_HOLD_NAMESPACE: &str = "runtime";
 const PAUSED_HOLD_NAMESPACE: &str = "paused";
 
@@ -82,6 +85,7 @@ pub(crate) struct ImageCacheService {
     staging_dir: PathBuf,
     metadata_store: OnceCell<ImageCacheMetadataStore>,
     source_images: Arc<SourceImageCache>,
+    oci_blob_locks: Arc<OciBlobLocks>,
     p2p_transport: OnceLock<Arc<dyn P2pTransport>>,
 }
 
@@ -128,6 +132,7 @@ impl ImageCacheService {
             commit_store,
             metadata_store: OnceCell::new(),
             source_images: Arc::new(SourceImageCache::default()),
+            oci_blob_locks: Arc::new(OciBlobLocks::default()),
             p2p_transport: OnceLock::new(),
         }
     }
@@ -544,16 +549,135 @@ impl ImageCacheService {
         watermark: Option<(u64, u64)>,
         min_age: Duration,
     ) -> Result<ImageCacheGcSummary> {
+        let blob_report;
         let reconciled = if let Some((high, low)) = watermark {
-            self.evict_source_configs_over_capacity(high, low, min_age)
+            let commit_bytes = self.recorded_hard_commit_bytes().await?;
+            blob_report = self
+                .evict_oci_blobs_over_capacity(high, low, min_age, commit_bytes)
                 .await?;
+            self.evict_source_configs_over_capacity(
+                high.saturating_sub(blob_report.remaining_bytes),
+                low.saturating_sub(blob_report.remaining_bytes),
+                min_age,
+            )
+            .await?;
             true
         } else {
+            blob_report = OciBlobGcReport::default();
             false
         };
         let live_refs = self.live_refs_from_running(running).await?;
         let report = self.run_gc(live_refs, !reconciled).await?;
-        Ok(ImageCacheGcSummary::from_report(&report))
+        let mut summary = ImageCacheGcSummary::from_report(&report);
+        summary.collected += blob_report.collected;
+        summary.freed_bytes += blob_report.freed_bytes;
+        Ok(summary)
+    }
+
+    async fn recorded_hard_commit_bytes(&self) -> Result<u64> {
+        Ok(self
+            .metadata_store()
+            .await?
+            .list_hard_commit_objects()
+            .await?
+            .into_iter()
+            .fold(0u64, |total, record| {
+                total.saturating_add(record.size.unwrap_or(0))
+            }))
+    }
+
+    fn oci_blob_cache_dir(&self) -> PathBuf {
+        self.staging_dir.join(OCI_BLOB_CACHE_DIR)
+    }
+
+    async fn evict_oci_blobs_over_capacity(
+        &self,
+        high_watermark_bytes: u64,
+        low_watermark_bytes: u64,
+        min_age: Duration,
+        commit_bytes: u64,
+    ) -> Result<OciBlobGcReport> {
+        let blob_dir = self.oci_blob_cache_dir().join("blobs").join("sha256");
+        let mut entries = match tokio::fs::read_dir(&blob_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OciBlobGcReport::default());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read OCI blob cache {}", blob_dir.display()));
+            }
+        };
+        let evictable_before = SystemTime::now().checked_sub(min_age).unwrap_or(UNIX_EPOCH);
+        let mut blob_bytes = 0u64;
+        let mut candidates = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let metadata = entry.metadata().await?;
+            let size = metadata.len();
+            blob_bytes = blob_bytes.saturating_add(size);
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            if modified <= evictable_before {
+                candidates.push((modified, entry.path(), entry.file_name()));
+            }
+        }
+
+        let mut report = OciBlobGcReport {
+            remaining_bytes: blob_bytes,
+            ..Default::default()
+        };
+        let mut total_bytes = commit_bytes.saturating_add(blob_bytes);
+        if total_bytes <= high_watermark_bytes {
+            return Ok(report);
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        for (_, path, filename) in candidates {
+            if total_bytes <= low_watermark_bytes {
+                break;
+            }
+            let Some(hex) = filename.to_str() else {
+                continue;
+            };
+            let lock = self.oci_blob_locks.lock(&format!("sha256:{hex}"));
+            let Ok(_guard) = lock.try_lock_owned() else {
+                continue;
+            };
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "failed to stat OCI blob cache entry");
+                    continue;
+                }
+            };
+            if metadata.modified().unwrap_or(UNIX_EPOCH) > evictable_before {
+                continue;
+            }
+            let size = metadata.len();
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    total_bytes = total_bytes.saturating_sub(size);
+                    report.remaining_bytes = report.remaining_bytes.saturating_sub(size);
+                    report.collected += 1;
+                    report.freed_bytes = report.freed_bytes.saturating_add(size);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "failed to evict OCI blob cache entry");
+                }
+            }
+        }
+        if report.collected > 0 {
+            info!(
+                collected = report.collected,
+                freed_bytes = report.freed_bytes,
+                "image cache reclaimed verified OCI source blobs"
+            );
+        }
+        Ok(report)
     }
 
     async fn live_refs_from_running(
@@ -1064,6 +1188,14 @@ impl ImageConversion for ConversionSession {
         self.hold.create_temp_staging_dir()
     }
 
+    fn create_oci_blob_cache_dir(&self) -> Result<PathBuf> {
+        self.hold.create_oci_blob_cache_dir()
+    }
+
+    fn oci_blob_locks(&self) -> Arc<OciBlobLocks> {
+        self.hold.oci_blob_locks()
+    }
+
     async fn lookup_converted_layer(
         &mut self,
         key: &LayerConversionKey,
@@ -1376,6 +1508,13 @@ impl ImageConversion for ImageCacheOperationHold {
         tempfile::tempdir_in(parent)
             .with_context(|| format!("create tempdir in {}", parent.display()))
     }
+    fn create_oci_blob_cache_dir(&self) -> Result<PathBuf> {
+        Ok(self.image_cache.oci_blob_cache_dir())
+    }
+
+    fn oci_blob_locks(&self) -> Arc<OciBlobLocks> {
+        Arc::clone(&self.image_cache.oci_blob_locks)
+    }
 
     async fn lookup_converted_layer(
         &mut self,
@@ -1536,6 +1675,13 @@ fn release_operation_hold_best_effort(
     let _release_task = handle.spawn(async move {
         image_cache.release_hold_best_effort(&owner, reason).await;
     });
+}
+
+#[derive(Default)]
+struct OciBlobGcReport {
+    collected: usize,
+    freed_bytes: u64,
+    remaining_bytes: u64,
 }
 
 enum HardCommitGcDecision {
@@ -2476,5 +2622,42 @@ mod tests {
             .await
             .expect("eviction");
         assert!(!config_path.exists());
+    }
+    #[tokio::test]
+    async fn maintenance_bounds_oci_blobs_without_deleting_active_blob() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("ensure layout");
+        let blob_dir = service.oci_blob_cache_dir().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blob_dir).expect("create blob cache");
+        let active_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let free_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let active = blob_dir.join(active_hex);
+        let free = blob_dir.join(free_hex);
+        std::fs::write(&active, b"active").expect("write active blob");
+        std::fs::write(&free, b"free").expect("write free blob");
+        let active_lock = service
+            .oci_blob_locks
+            .lock(&format!("sha256:{active_hex}"))
+            .lock_owned()
+            .await;
+
+        let first = service
+            .run_maintenance(Vec::new(), Some((1, 0)), Duration::from_secs(0))
+            .await
+            .expect("run maintenance with active blob");
+        assert!(active.exists());
+        assert!(!free.exists());
+        assert_eq!(first.collected, 1);
+        assert_eq!(first.freed_bytes, 4);
+
+        drop(active_lock);
+        let second = service
+            .run_maintenance(Vec::new(), Some((1, 0)), Duration::from_secs(0))
+            .await
+            .expect("run maintenance after blob release");
+        assert!(!active.exists());
+        assert_eq!(second.collected, 1);
+        assert_eq!(second.freed_bytes, 6);
     }
 }

@@ -144,7 +144,7 @@ Node-local cache root for resolved and converted user images.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `root_dir` | string | `"$AENV_HOME/image-cache"` | Root directory for AgentENV image-cache artifacts |
-| `capacity_gb` | integer | `100` | Budget for capacity-driven eviction of local commit bytes. Enforced only when `[image.cache.gc].enabled` is `true`: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Unset = no capacity cap. |
+| `capacity_gb` | integer | `100` | Budget for capacity-driven eviction of converted commits and persistent source OCI blobs. Enforced only when `[image.cache.gc].enabled` is `true`: background GC evicts least-recently-used source configs and verified source blobs once combined usage crosses the high watermark, down to the low watermark. Unset = no capacity cap. |
 
 ## `[image.cache.gc]`
 
@@ -153,15 +153,16 @@ each pass reconciles metadata from the on-disk source configs and then deletes
 hard-commit objects that are no longer rooted by source configs, held by
 image-cache leases, or referenced by the in-process running set. Committed
 snapshots are durable SnapshotRepository state and do not pin ImageCache
-commits. With `capacity_gb` set, GC first evicts least-recently-used source
-configs over the high watermark so hard-commit GC can reclaim what they unrooted.
+commits. With `capacity_gb` set, GC evicts least-recently-used source configs
+and verified source OCI blobs over the combined high watermark so hard-commit
+and source-blob GC can reclaim space.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable the background image-cache GC task |
 | `interval_secs` | integer | `1800` | Seconds between GC passes (a value `<= 0` falls back to the default) |
 | `min_age_secs` | integer | `600` | Minimum time since last use before a source config is eligible for capacity eviction (the LRU floor) |
-| `high_watermark_ratio` | float | `0.95` | Begin capacity eviction once local commit bytes exceed `capacity_gb` × this ratio. Clamped to `(0, 1]` |
+| `high_watermark_ratio` | float | `0.95` | Begin capacity eviction once combined converted-commit and persistent source-blob bytes exceed `capacity_gb` × this ratio. Clamped to `(0, 1]` |
 | `low_watermark_ratio` | float | `0.70` | Evict down to `capacity_gb` × this ratio once the high watermark trips. Clamped to `(0, high_watermark_ratio]` |
 
 Capacity-driven eviction runs only when `[image.cache].capacity_gb` is set;

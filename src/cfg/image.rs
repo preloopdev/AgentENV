@@ -50,9 +50,10 @@ pub struct ImageResolverConfig {
 pub struct ImageCacheConfig {
     #[config(default = "$AENV_HOME/image-cache")]
     pub root_dir: PathBuf,
-    /// Budget for capacity-driven eviction of local commit bytes. Enforced only
-    /// when `[image.cache.gc].enabled` is set: the GC evicts least-recently-used
-    /// source configs once usage crosses the high watermark. Unset = no cap.
+    /// Budget for capacity-driven eviction of local commits and persistent
+    /// source OCI blobs. Enforced only when `[image.cache.gc].enabled` is set:
+    /// the GC evicts least-recently-used source configs and blobs once usage
+    /// crosses the high watermark. Unset = no cap.
     pub capacity_gb: Option<u64>,
     #[config(nested)]
     pub remote_blocks: ImageRemoteBlocksCacheConfig,
@@ -78,7 +79,8 @@ pub struct ImageCacheGcConfig {
     /// capacity-driven eviction (the LRU floor).
     #[config(default = 600u64)]
     pub min_age_secs: u64,
-    /// Start evicting when local commit bytes exceed `capacity_gb` * this ratio.
+    /// Start evicting when tracked local commit and source-blob bytes exceed
+    /// `capacity_gb` * this ratio.
     #[config(default = 0.95)]
     pub high_watermark_ratio: f64,
     /// Evict down to `capacity_gb` * this ratio once the high watermark trips.

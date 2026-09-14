@@ -3,6 +3,7 @@ mod manifest;
 mod publisher;
 mod source_image;
 
+pub(crate) use client::{load_docker_credentials, DockerRegistryCredentials};
 pub(crate) use manifest::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, OCI_IMAGE_MANIFEST_MEDIA_TYPE,

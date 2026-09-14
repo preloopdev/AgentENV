@@ -6,10 +6,10 @@
 //! * **Standard OCI tar layers** (tar / tar+gzip / tar+zstd). After manifest
 //!   inspection, layer digests are checked against the OCI→commit indexes. If
 //!   every layer already has a converted `.commit` in the content-addressed
-//!   commit cache, no blobs are downloaded. Missing cache entries trigger a
-//!   background `regctl image copy` into a staging OCI layout; conversion waits
-//!   only for the next needed layer blob to appear, and still applies layers
-//!   strictly in image order.
+//!   commit cache, no blobs are downloaded. Missing cache entries are fetched
+//!   one at a time with `regctl blob get` into a persistent content-addressed
+//!   cache; each attempt is written to a private file and verified before
+//!   atomic publication, then layers are converted strictly in image order.
 //!
 //! * **Overlaybd-native layers** (mediaType advertises the overlaybd/zfile
 //!   format). The remote blob is already a sealed overlaybd lower — no blob
@@ -30,16 +30,22 @@
 //! reaching this module.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
+use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, RANGE, WWW_AUTHENTICATE};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
@@ -49,15 +55,17 @@ use super::local_layer::LocalLayer;
 use super::{
     env_vars_from_entries, ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult,
 };
-use crate::digest;
+use crate::digest::{self, FileDigest};
 use crate::p2p::P2pArtifactKey;
+use crate::snapshot::repository::backends::common::acr::load_docker_credentials;
 
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
+const OCI_BLOB_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const OCI_BLOB_HTTP_RECONNECT_ATTEMPTS: u32 = 256;
 const REGCTL_GOMAXPROCS: &str = "4";
 pub(crate) const REGCTL_RETRY_ATTEMPTS: u32 = 5;
 pub(crate) const REGCTL_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
-const OCI_LAYER_BLOB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
 /// VM sees this as the rootfs device capacity; actual storage is only what the
@@ -169,6 +177,16 @@ pub(crate) trait ImageConversion: Send + Sync {
     /// placed on the same filesystem as the overlaybd commit cache so
     /// `layer.commit` can be hard-linked into the cache (avoids EXDEV).
     fn create_temp_staging_dir(&self) -> Result<tempfile::TempDir>;
+
+    /// Return the persistent cache for verified source OCI blobs.
+    ///
+    /// Blobs are content-addressed and atomically published only after their
+    /// size and SHA-256 digest have been checked. Keeping this cache outside
+    /// the per-operation tempdir lets a later conversion reuse completed
+    /// multi-gigabyte downloads.
+    fn create_oci_blob_cache_dir(&self) -> Result<PathBuf>;
+    /// Return the shared per-digest locks used by blob downloads and cache GC.
+    fn oci_blob_locks(&self) -> Arc<OciBlobLocks>;
 
     async fn lookup_converted_layer(
         &mut self,
@@ -298,7 +316,7 @@ pub(crate) async fn convert_fetched_oci_image_to_overlaybd(
             info!(
                 image = image_ref,
                 layers = manifest.layers.len(),
-                "source image is standard OCI; starting background image copy because at least one converted layer is missing"
+                "source image is standard OCI; downloading missing blobs individually with verification"
             );
             let work = sink.create_temp_staging_dir()?;
             let selected_image_ref = fetched.selected_image_ref.as_str();
@@ -390,9 +408,12 @@ async fn convert_standard_oci_layers_pipeline(
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
 ) -> Result<Vec<LocalLayer>> {
-    let layout_dir = work_root.join("oci");
-    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir).await?;
-    let result = convert_standard_oci_layers_pipeline_inner(
+    let blob_cache_dir = sink.create_oci_blob_cache_dir()?;
+    let blob_locks = sink.oci_blob_locks();
+    let mut producer =
+        RegctlImageCopyProducer::start(regctl_binary, image_ref, blob_cache_dir, blob_locks)
+            .await?;
+    convert_standard_oci_layers_pipeline_inner(
         manifest,
         image_ref,
         work_root,
@@ -401,27 +422,7 @@ async fn convert_standard_oci_layers_pipeline(
         converter,
         &mut producer,
     )
-    .await;
-    match result {
-        Ok(lowers) => {
-            if let Err(err) = producer.abort().await {
-                warn!(
-                    error = %err,
-                    "failed to cleanly abort background regctl image copy after successful conversion"
-                );
-            }
-            Ok(lowers)
-        }
-        Err(err) => {
-            if let Err(abort_err) = producer.abort().await {
-                warn!(
-                    error = %abort_err,
-                    "failed to cleanly abort background regctl image copy after conversion failure"
-                );
-            }
-            Err(err)
-        }
-    }
+    .await
 }
 
 async fn convert_standard_oci_layers_pipeline_inner(
@@ -457,7 +458,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
         let blob_path = producer
             .wait_layer_blob(idx, layer)
             .await
-            .with_context(|| format!("wait for copied layer {} ({})", idx, layer.digest))?;
+            .with_context(|| format!("download layer {} ({})", idx, layer.digest))?;
         let layer_work = work_root.join(format!("layer-{idx}"));
 
         let layer_commit = converter
@@ -486,15 +487,31 @@ async fn convert_standard_oci_layers_pipeline_inner(
 
 struct RegctlImageCopyProducer {
     regctl_binary: PathBuf,
-    image_ref: String,
-    layout_dir: PathBuf,
-    child: Option<tokio::process::Child>,
-    stdout_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    stderr_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    exit_status: Option<std::process::ExitStatus>,
-    stderr: Option<String>,
-    attempts_started: u32,
-    backoff: Duration,
+    registry: String,
+    repository: String,
+    repository_path: String,
+    blob_cache_dir: PathBuf,
+    blob_locks: Arc<OciBlobLocks>,
+    prefer_http_resume: bool,
+    active_blob_guard: Option<OwnedMutexGuard<()>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OciBlobLocks {
+    locks: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl OciBlobLocks {
+    pub(crate) fn lock(&self, digest: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().expect("OCI blob lock map poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(digest).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(digest.to_string(), Arc::downgrade(&lock));
+        lock
+    }
 }
 
 #[async_trait]
@@ -618,58 +635,355 @@ impl RegctlImageCopyProducer {
     async fn start(
         regctl_binary: &Path,
         image_ref: &str,
-        layout_dir: PathBuf,
+        blob_cache_dir: PathBuf,
+        blob_locks: Arc<OciBlobLocks>,
     ) -> ImageResult<Self> {
         ensure_regctl_binary(regctl_binary)?;
-        let mut producer = Self {
+        let (registry, repository_path) = parse_image_ref(image_ref).map_err(ImageError::Other)?;
+        let repository = format!("{registry}/{repository_path}");
+        let blob_store = blob_cache_dir.join("blobs").join("sha256");
+        tokio::fs::create_dir_all(&blob_store)
+            .await
+            .with_context(|| format!("create OCI blob cache {}", blob_store.display()))
+            .map_err(ImageError::Other)?;
+        Ok(Self {
             regctl_binary: regctl_binary.to_path_buf(),
-            image_ref: image_ref.to_string(),
-            layout_dir,
-            child: None,
-            stdout_task: None,
-            stderr_task: None,
-            exit_status: None,
-            stderr: None,
-            attempts_started: 0,
-            backoff: REGCTL_RETRY_BASE_DELAY,
-        };
-        producer.spawn_child()?;
-        Ok(producer)
+            registry,
+            repository,
+            repository_path,
+            blob_cache_dir,
+            blob_locks,
+            prefer_http_resume: false,
+            active_blob_guard: None,
+        })
     }
 
-    fn spawn_child(&mut self) -> ImageResult<()> {
-        self.abort_pipe_tasks();
-        self.exit_status = None;
-        self.stderr = None;
-        let dest = format!("ocidir://{}:latest", self.layout_dir.display());
+    async fn download_blob_once(
+        &self,
+        digest: &str,
+        expected_size: u64,
+        destination: &Path,
+    ) -> Result<()> {
         let mut command = regctl_command(&self.regctl_binary);
         command
-            .args([
-                "image",
-                "copy",
-                "--platform",
-                "local",
-                &self.image_ref,
-                &dest,
-            ])
+            .args(["blob", "get", &self.repository, digest])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().context("spawn regctl image copy")?;
-        let stdout_task = child
+        let mut child = command.spawn().context("spawn regctl blob get")?;
+        let stdout = child
             .stdout
             .take()
-            .map(|stdout| tokio::spawn(read_pipe_to_end(stdout)));
-        let stderr_task = child
+            .context("regctl blob get stdout was not piped")?;
+        let stderr = child
             .stderr
             .take()
-            .map(|stderr| tokio::spawn(read_pipe_to_end(stderr)));
-        self.child = Some(child);
-        self.stdout_task = stdout_task;
-        self.stderr_task = stderr_task;
-        self.attempts_started += 1;
+            .context("regctl blob get stderr was not piped")?;
+        let destination = destination.to_path_buf();
+        let mut stdout_task = tokio::spawn(copy_blob_stdout(
+            stdout,
+            destination,
+            expected_size,
+            OCI_BLOB_READ_IDLE_TIMEOUT,
+        ));
+        let stderr_task = tokio::spawn(read_pipe_to_end(stderr));
+
+        let (status, complete) = tokio::select! {
+            output = &mut stdout_task => {
+                match output {
+                    Ok(Ok(complete)) => {
+                        if complete {
+                            terminate_child(&mut child).await;
+                            (None, true)
+                        } else {
+                            (Some(child.wait().await.context("wait for regctl blob get")?), false)
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        terminate_child(&mut child).await;
+                        let _ = stderr_task.await;
+                        return Err(error.context("write regctl blob output"));
+                    }
+                    Err(error) => {
+                        terminate_child(&mut child).await;
+                        let _ = stderr_task.await;
+                        return Err(anyhow::Error::new(error).context("join regctl blob output task"));
+                    }
+                }
+            }
+            status = child.wait() => {
+                let status = status.context("wait for regctl blob get")?;
+                let complete = stdout_task
+                    .await
+                    .context("join regctl blob output task")?
+                    .context("write regctl blob output")?;
+                (Some(status), complete)
+            }
+        };
+        let stderr = stderr_task
+            .await
+            .context("join regctl blob error task")?
+            .context("read regctl blob stderr")?;
+        if !complete {
+            if let Some(status) = status {
+                if !status.success() {
+                    bail!(
+                        "regctl blob get {} {} failed with {:?}: {}",
+                        self.repository,
+                        digest,
+                        status.code(),
+                        String::from_utf8_lossy(&stderr).trim()
+                    );
+                }
+            }
+        }
         Ok(())
     }
+
+    async fn download_blob_with_http(
+        &self,
+        digest: &str,
+        expected_size: u64,
+        destination: &Path,
+    ) -> Result<()> {
+        let credentials =
+            load_docker_credentials(&self.registry).context("load registry credentials")?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .context("build OCI blob HTTP client")?;
+        let blob_url = format!(
+            "https://{}/v2/{}/blobs/{}",
+            self.registry, self.repository_path, digest
+        );
+        let mut file = tokio::fs::File::create(destination)
+            .await
+            .with_context(|| format!("create OCI blob output {}", destination.display()))?;
+        let mut copied = 0u64;
+        let mut authorization = None;
+        let mut retry_delay = Duration::from_millis(250);
+        let mut last_error = String::new();
+
+        for reconnect in 1..=OCI_BLOB_HTTP_RECONNECT_ATTEMPTS {
+            let mut request = client.get(&blob_url);
+            if let Some(value) = &authorization {
+                request = request.header(AUTHORIZATION, value);
+            }
+            if copied > 0 {
+                request = request.header(RANGE, format!("bytes={copied}-"));
+            }
+            let mut response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                let challenge = response
+                    .headers()
+                    .get(WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok())
+                    .context("registry 401 response omitted WWW-Authenticate")?;
+                authorization = Some(
+                    registry_pull_authorization(
+                        &client,
+                        challenge,
+                        &self.repository_path,
+                        credentials.as_ref(),
+                    )
+                    .await?,
+                );
+                continue;
+            }
+            if copied == 0 {
+                anyhow::ensure!(
+                    response.status() == StatusCode::OK,
+                    "OCI blob GET returned {}",
+                    response.status()
+                );
+            } else {
+                anyhow::ensure!(
+                    response.status() == StatusCode::PARTIAL_CONTENT,
+                    "OCI blob range GET at byte {copied} returned {}",
+                    response.status()
+                );
+                let content_range = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .context("OCI blob range response omitted Content-Range")?;
+                anyhow::ensure!(
+                    content_range.starts_with(&format!("bytes {copied}-")),
+                    "OCI blob range response started at the wrong offset: {content_range}"
+                );
+            }
+
+            let before = copied;
+            while copied < expected_size {
+                let chunk = match tokio::time::timeout(OCI_BLOB_READ_IDLE_TIMEOUT, response.chunk())
+                    .await
+                {
+                    Ok(Ok(Some(chunk))) => chunk,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(error)) => {
+                        last_error = error.to_string();
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = format!(
+                            "OCI blob download produced no data for {} seconds: {error}",
+                            OCI_BLOB_READ_IDLE_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                };
+                anyhow::ensure!(
+                    copied + chunk.len() as u64 <= expected_size,
+                    "OCI blob response exceeded expected size {expected_size}"
+                );
+                file.write_all(&chunk).await?;
+                copied += chunk.len() as u64;
+            }
+            if copied == expected_size {
+                file.flush().await?;
+                return Ok(());
+            }
+            if copied > before {
+                retry_delay = Duration::from_millis(250);
+            }
+            warn!(
+                reconnect,
+                copied,
+                expected_size,
+                digest,
+                error = %last_error,
+                "OCI blob stream interrupted; resuming with an HTTP range request"
+            );
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+        bail!(
+            "OCI blob download exhausted {OCI_BLOB_HTTP_RECONNECT_ATTEMPTS} reconnects at byte {copied} of {expected_size}: {last_error}"
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct RegistryTokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+}
+
+async fn registry_pull_authorization(
+    client: &reqwest::Client,
+    challenge: &str,
+    repository: &str,
+    credentials: Option<
+        &crate::snapshot::repository::backends::common::acr::DockerRegistryCredentials,
+    >,
+) -> Result<String> {
+    if challenge
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("basic "))
+    {
+        let credentials = credentials.context("registry requires basic credentials")?;
+        return Ok(format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{}:{}", credentials.username, credentials.password))
+        ));
+    }
+    anyhow::ensure!(
+        challenge
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer ")),
+        "unsupported registry authentication challenge: {challenge}"
+    );
+    let realm = auth_challenge_parameter(challenge, "realm")
+        .context("registry bearer challenge omitted realm")?;
+    let service = auth_challenge_parameter(challenge, "service");
+    let scope = auth_challenge_parameter(challenge, "scope")
+        .unwrap_or_else(|| format!("repository:{repository}:pull"));
+    let mut request = client.get(realm).query(&[("scope", scope.as_str())]);
+    if let Some(service) = service.as_deref() {
+        request = request.query(&[("service", service)]);
+    }
+    if let Some(credentials) = credentials {
+        request = request.basic_auth(&credentials.username, Some(&credentials.password));
+    }
+    let response = request
+        .send()
+        .await
+        .context("request registry pull token")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "registry token service returned {}",
+        response.status()
+    );
+    let token: RegistryTokenResponse = response
+        .json()
+        .await
+        .context("parse registry token response")?;
+    let token = token
+        .token
+        .or(token.access_token)
+        .context("registry token response omitted token")?;
+    Ok(format!("Bearer {token}"))
+}
+
+fn auth_challenge_parameter(challenge: &str, name: &str) -> Option<String> {
+    challenge
+        .split_once(' ')?
+        .1
+        .split(',')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(key, value)| {
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+}
+
+async fn copy_blob_stdout<R>(
+    mut stdout: R,
+    destination: PathBuf,
+    expected_size: u64,
+    idle_timeout: Duration,
+) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut file = tokio::fs::File::create(&destination)
+        .await
+        .with_context(|| format!("create OCI blob output {}", destination.display()))?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    while copied < expected_size {
+        let remaining = usize::try_from(expected_size - copied)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = tokio::time::timeout(idle_timeout, stdout.read(&mut buffer[..remaining]))
+            .await
+            .with_context(|| {
+                format!(
+                    "OCI blob download produced no data for {} seconds",
+                    idle_timeout.as_secs()
+                )
+            })??;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).await?;
+        copied += read as u64;
+    }
+    file.flush().await?;
+    Ok(copied == expected_size)
+}
+
+async fn terminate_child(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[async_trait]
@@ -679,158 +993,146 @@ impl LayerBlobSource for RegctlImageCopyProducer {
         idx: usize,
         layer: &OciLayerDescriptor,
     ) -> ImageResult<PathBuf> {
-        let blob_path = blob_path_for_digest(&self.layout_dir, &layer.digest)?;
-        loop {
-            if layer_blob_is_ready(&blob_path, layer.size).await? {
-                debug!(
-                    idx,
-                    digest = %layer.digest,
-                    path = %blob_path.display(),
-                    "OCI layer blob is ready in background image-copy layout"
-                );
-                return Ok(blob_path);
-            }
+        self.active_blob_guard = None;
+        let guard = self.blob_locks.lock(&layer.digest).lock_owned().await;
+        let blob_path = blob_path_for_digest(&self.blob_cache_dir, &layer.digest)?;
+        if layer_blob_is_verified(&blob_path, &layer.digest, layer.size)
+            .await
+            .map_err(ImageError::Other)?
+        {
+            debug!(
+                idx,
+                digest = %layer.digest,
+                path = %blob_path.display(),
+                "reusing verified OCI layer blob from persistent cache"
+            );
+            self.active_blob_guard = Some(guard);
+            return Ok(blob_path);
+        }
+        if tokio::fs::metadata(&blob_path).await.is_ok() {
+            warn!(
+                idx,
+                digest = %layer.digest,
+                path = %blob_path.display(),
+                "discarding invalid cached OCI layer blob"
+            );
+            tokio::fs::remove_file(&blob_path)
+                .await
+                .with_context(|| format!("remove invalid OCI blob {}", blob_path.display()))
+                .map_err(ImageError::Other)?;
+        }
 
-            if let Some(status) = self.poll_exit().await? {
-                if !status.success() {
-                    let stderr = self.stderr_text().await;
-                    if regctl_stderr_is_not_found(&stderr) {
+        let mut backoff = REGCTL_RETRY_BASE_DELAY;
+        let mut last_error = String::new();
+        let mut use_http_resume = self.prefer_http_resume;
+        for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
+            let attempt_dir = tempfile::tempdir_in(&self.blob_cache_dir)
+                .with_context(|| {
+                    format!(
+                        "create OCI blob attempt dir {}",
+                        self.blob_cache_dir.display()
+                    )
+                })
+                .map_err(ImageError::Other)?;
+            let partial_path = attempt_dir.path().join("blob");
+            let result = if use_http_resume {
+                self.download_blob_with_http(&layer.digest, layer.size, &partial_path)
+                    .await
+            } else {
+                self.download_blob_once(&layer.digest, layer.size, &partial_path)
+                    .await
+            };
+            let result = match result {
+                Ok(()) => verify_blob_file(&partial_path, &layer.digest, layer.size).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    tokio::fs::rename(&partial_path, &blob_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "publish verified OCI blob {} as {}",
+                                partial_path.display(),
+                                blob_path.display()
+                            )
+                        })
+                        .map_err(ImageError::Other)?;
+                    info!(
+                        idx,
+                        digest = %layer.digest,
+                        size = layer.size,
+                        attempt,
+                        path = %blob_path.display(),
+                        "downloaded and verified OCI layer blob"
+                    );
+                    self.active_blob_guard = Some(guard);
+                    return Ok(blob_path);
+                }
+                Err(error) => {
+                    last_error = format!("{error:#}");
+                    if last_error.contains("PROTOCOL_ERROR") {
+                        use_http_resume = true;
+                        self.prefer_http_resume = true;
+                    }
+                    if regctl_stderr_is_not_found(&last_error) {
                         return Err(ImageError::NotFound {
                             reason: format!(
-                                "regctl image copy reported the OCI resource does not exist: {stderr}",
+                                "regctl blob get reported the OCI resource does not exist: {last_error}"
                             ),
                         });
                     }
-                    if self.attempts_started < REGCTL_RETRY_ATTEMPTS {
+                    if attempt < REGCTL_RETRY_ATTEMPTS {
                         warn!(
-                            attempt = self.attempts_started,
+                            attempt,
                             idx,
                             digest = %layer.digest,
-                            error = %stderr,
-                            "regctl image copy failed before needed layer was ready; retrying"
+                            error = %last_error,
+                            "OCI layer download failed; retrying the individual blob"
                         );
-                        tokio::time::sleep(self.backoff).await;
-                        self.backoff *= 2;
-                        self.spawn_child()?;
-                        continue;
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
                     }
-                    return Err(ImageError::Other(anyhow!(
-                        "regctl image copy failed after {REGCTL_RETRY_ATTEMPTS} attempts with {:?}: {stderr}",
-                        status.code(),
-                    )));
                 }
-                if layer_blob_is_ready(&blob_path, layer.size).await? {
-                    return Ok(blob_path);
-                }
-                return Err(ImageError::Other(anyhow!(
-                    "regctl image copy completed but layer {idx} ({}) is missing or has unexpected size at {}",
-                    layer.digest,
-                    blob_path.display()
-                )));
             }
-
-            tokio::time::sleep(OCI_LAYER_BLOB_POLL_INTERVAL).await;
         }
+        Err(ImageError::Other(anyhow!(
+            "OCI blob download failed after {REGCTL_RETRY_ATTEMPTS} attempts for layer {idx} ({}): {last_error}",
+            layer.digest
+        )))
     }
 }
 
-impl RegctlImageCopyProducer {
-    async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        if let Some(status) = self.exit_status {
-            return Ok(Some(status));
+async fn layer_blob_is_verified(
+    path: &Path,
+    expected_digest: &str,
+    expected_size: u64,
+) -> Result<bool> {
+    match FileDigest::describe(path).await {
+        Ok(actual) => {
+            Ok(actual.size == expected_size && actual.sha256.eq_ignore_ascii_case(expected_digest))
         }
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let Some(status) = child.try_wait().context("poll regctl image copy")? else {
-            return Ok(None);
-        };
-        self.exit_status = Some(status);
-        self.child = None;
-        Ok(Some(status))
-    }
-
-    async fn stderr_text(&mut self) -> String {
-        if let Some(stderr) = &self.stderr {
-            return stderr.clone();
-        }
-        let stderr = match self.stderr_task.take() {
-            Some(task) => match task.await {
-                Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_string(),
-                Ok(Err(err)) => format!("failed to read regctl stderr: {err}"),
-                Err(err) => format!("failed to join regctl stderr reader: {err}"),
-            },
-            None => String::new(),
-        };
-        self.stderr = Some(stderr.clone());
-        stderr
-    }
-
-    async fn abort(&mut self) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let status = child
-                .wait()
-                .await
-                .context("wait killed regctl image copy")?;
-            self.exit_status = Some(status);
-        }
-        if let Some(task) = self.stdout_task.take() {
-            match task.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    debug!(error = %err, "failed to drain regctl image copy stdout during abort");
-                }
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => return Err(anyhow::Error::new(err).context("join regctl stdout task")),
-            }
-        }
-        if let Some(task) = self.stderr_task.take() {
-            match task.await {
-                Ok(Ok(bytes)) => {
-                    self.stderr
-                        .get_or_insert_with(|| String::from_utf8_lossy(&bytes).trim().to_string());
-                }
-                Ok(Err(err)) => {
-                    debug!(error = %err, "failed to drain regctl image copy stderr during abort");
-                }
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => return Err(anyhow::Error::new(err).context("join regctl stderr task")),
-            }
-        }
-        Ok(())
-    }
-
-    fn abort_pipe_tasks(&mut self) {
-        if let Some(task) = self.stdout_task.take() {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-        if let Some(task) = self.stderr_task.take() {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("describe OCI layer blob {}", path.display()))),
     }
 }
 
-impl Drop for RegctlImageCopyProducer {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
-        if let Some(task) = &self.stdout_task {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-        if let Some(task) = &self.stderr_task {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-    }
+async fn verify_blob_file(path: &Path, expected_digest: &str, expected_size: u64) -> Result<()> {
+    let actual = FileDigest::describe(path)
+        .await
+        .with_context(|| format!("hash OCI layer blob {}", path.display()))?;
+    anyhow::ensure!(
+        actual.size == expected_size,
+        "OCI blob size mismatch for {expected_digest}: expected {expected_size}, got {}",
+        actual.size
+    );
+    anyhow::ensure!(
+        actual.sha256.eq_ignore_ascii_case(expected_digest),
+        "OCI blob digest mismatch for {expected_digest}: fetched {}",
+        actual.sha256
+    );
+    Ok(())
 }
 
 async fn read_pipe_to_end<R>(mut reader: R) -> std::io::Result<Vec<u8>>
@@ -840,16 +1142,6 @@ where
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await?;
     Ok(buffer)
-}
-
-async fn layer_blob_is_ready(path: &Path, expected_size: u64) -> Result<bool> {
-    match tokio::fs::metadata(path).await {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == expected_size),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => {
-            Err(anyhow::Error::new(err).context(format!("stat OCI layer blob {}", path.display())))
-        }
-    }
 }
 
 // ---- manifest fetch ----
@@ -933,24 +1225,6 @@ pub(crate) fn regctl_stderr_is_not_found(stderr: &str) -> bool {
     stderr.contains("[http 404]")
 }
 
-/// Build a [`Command`] for `regctl` with a bounded Go runtime.
-///
-/// `regctl` is a Go binary; the Go runtime defaults GOMAXPROCS to the number
-/// of host CPUs, spawning roughly that many OS threads per process. Because
-/// AgentENV forks a short-lived `regctl` per image operation and can do so at
-/// high concurrency, on many-core hosts the default fans out into a large
-/// number of threads and can exhaust the process/PID limit. regctl's work is
-/// network/IO-bound rather than CPU-bound, so a small GOMAXPROCS caps the
-/// thread footprint without affecting throughput.
-///
-/// All `regctl` invocations must be constructed through this so the cap is
-/// applied uniformly.
-pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(binary);
-    command.env("GOMAXPROCS", REGCTL_GOMAXPROCS);
-    command
-}
-
 /// Run a regctl invocation, retrying failures with exponential backoff to
 /// absorb transient registry errors.
 pub(crate) async fn run_regctl(
@@ -991,6 +1265,13 @@ pub(crate) async fn run_regctl(
         "regctl {} failed after {REGCTL_RETRY_ATTEMPTS} attempts: {last_stderr}",
         args.join(" ")
     )))
+}
+
+/// Build a `regctl` command with a bounded Go runtime thread footprint.
+pub(crate) fn regctl_command(binary: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(binary);
+    command.env("GOMAXPROCS", REGCTL_GOMAXPROCS);
+    command
 }
 
 pub(crate) fn ensure_regctl_binary(path: &Path) -> ImageResult<()> {
@@ -2231,6 +2512,123 @@ mod tests {
         verify_blob_digest(&digest::sha256_digest(bytes), bytes).expect("matching digest");
         assert!(verify_blob_digest(&digest::sha256_digest(b"other"), bytes).is_err());
         assert!(verify_blob_digest("sha512:abc", bytes).is_err());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regctl_blob_download_retries_bad_bytes_and_reuses_verified_cache() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir()?;
+        let regctl = tmp.path().join("regctl");
+        fs::write(
+            &regctl,
+            r#"#!/bin/sh
+count_file="$0.count"
+count=0
+if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf 'corrupt'
+else
+  printf 'verified-layer'
+fi
+"#,
+        )?;
+        let mut permissions = fs::metadata(&regctl)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&regctl, permissions)?;
+
+        let bytes = b"verified-layer";
+        let layer = OciLayerDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            digest: digest::sha256_digest(bytes),
+            size: bytes.len() as u64,
+            annotations: BTreeMap::new(),
+        };
+        let cache = tmp.path().join("oci-blobs");
+        let mut producer = RegctlImageCopyProducer::start(
+            &regctl,
+            "registry.example/team/image:tag",
+            cache,
+            Arc::new(OciBlobLocks::default()),
+        )
+        .await?;
+
+        let path = producer.wait_layer_blob(0, &layer).await?;
+        assert_eq!(fs::read(&path)?, bytes);
+        let reused = producer.wait_layer_blob(0, &layer).await?;
+        assert_eq!(reused, path);
+        assert_eq!(fs::read_to_string(regctl.with_extension("count"))?, "2");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regctl_blob_download_terminates_when_destination_write_fails() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir()?;
+        let regctl = tmp.path().join("regctl");
+        fs::write(
+            &regctl,
+            "#!/bin/sh\nwhile :; do printf 'keep-writing'; done\n",
+        )?;
+        let mut permissions = fs::metadata(&regctl)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&regctl, permissions)?;
+        let cache = tmp.path().join("oci-blobs");
+        let producer = RegctlImageCopyProducer::start(
+            &regctl,
+            "registry.example/team/image:tag",
+            cache,
+            Arc::new(OciBlobLocks::default()),
+        )
+        .await?;
+        let destination = tmp.path().join("destination-is-a-directory");
+        fs::create_dir(&destination)?;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            producer.download_blob_once("sha256:any", 128, &destination),
+        )
+        .await
+        .expect("writer failure must terminate regctl instead of hanging");
+        assert!(result
+            .expect_err("directory destination must fail")
+            .to_string()
+            .contains("write regctl blob output"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn blob_copy_fails_after_read_idle_timeout() -> Result<()> {
+        let tmp = tempdir()?;
+        let destination = tmp.path().join("blob");
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"partial").await?;
+
+        let error = copy_blob_stdout(reader, destination, 8, Duration::from_millis(20))
+            .await
+            .expect_err("stalled stream must time out");
+        assert!(error.to_string().contains("produced no data"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_copy_completes_at_expected_size_without_eof() -> Result<()> {
+        let tmp = tempdir()?;
+        let destination = tmp.path().join("blob");
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"complete").await?;
+
+        let complete = tokio::time::timeout(
+            Duration::from_secs(1),
+            copy_blob_stdout(reader, destination.clone(), 8, Duration::from_secs(30)),
+        )
+        .await
+        .expect("expected byte count must complete without waiting for EOF")?;
+        assert!(complete);
+        assert_eq!(fs::read(destination)?, b"complete");
+        Ok(())
     }
 
     #[test]
