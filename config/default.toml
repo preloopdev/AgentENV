@@ -264,6 +264,19 @@ workers = 1
 # access_key_secret = "..."
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
+#
+# Optional read-only mirror. Reads fall back to it when the primary endpoint is
+# unreachable; writes and deletes always stay on the primary. Immutable managed
+# layer blobs also fall back on NotFound; mutable records never do.
+# [backend.oss.fallback]
+# endpoint = "https://s3.durable-mirror.example"
+# bucket = "your-mirror-bucket"
+# region = "cn-beijing"
+# prefix = "snapshots/"
+# access_key_id = "..."               # defaults to the primary credentials
+# access_key_secret = "..."
+# cooldown_secs = 30                  # seconds before re-probing the primary
+# primary_timeout_secs = 5            # bounded primary read timeout for fast failover
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.

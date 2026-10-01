@@ -177,6 +177,7 @@ mod tests {
                 region: Some("test".to_owned()),
                 addressing_style: None,
                 cache_max_size_gb: None,
+                fallback: None,
             });
             let builder = builder_snapshot_config(&config);
             assert_eq!(

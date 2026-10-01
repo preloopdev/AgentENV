@@ -97,6 +97,7 @@ name = "agentenv"
 version = "0.2.1"
 dependencies = [
  "agentenv-observability",
+ "agentenv-test-support",
  "agentenv_http_server",
  "anyhow",
  "async-trait",

@@ -1,4 +1,4 @@
-use crate::config::OssConfig;
+use crate::config::{OssConfig, OssFallbackConfig};
 use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
@@ -13,12 +13,14 @@ use object_store_operator::{
 use reqwest::Url;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_COUNT: u32 = 3;
@@ -43,7 +45,98 @@ struct OssBackendInner {
     addressing_override: Option<AddressingStyle>,
     timeout: Duration,
     retry_count: u32,
+    fallback: Option<FallbackRuntime>,
     cached_operators: RwLock<HashMap<OperatorCacheKey, OperatorWithCredential>>,
+}
+
+/// Read-only mirror used when the primary object store is unreachable.
+///
+/// Holds the resolved fallback location/credentials plus the circuit-breaker
+/// state: after a primary read fails with an unavailability error, reads are
+/// served from the mirror for [`FallbackRuntime::cooldown`] before the primary
+/// is probed again. State is per backend instance and lock-free.
+#[derive(Debug)]
+struct FallbackRuntime {
+    endpoint: String,
+    region: String,
+    bucket: Option<String>,
+    primary_key_prefix: String,
+    key_prefix: String,
+    addressing_override: Option<AddressingStyle>,
+    credentials: CachedCredentialSource,
+    cooldown: Duration,
+    primary_timeout: Duration,
+    /// Unix-millis until which reads bypass the primary. 0 means the primary is
+    /// eligible for a probe.
+    unavailable_until: AtomicU64,
+}
+
+impl FallbackRuntime {
+    fn is_tripped(&self) -> bool {
+        self.unavailable_until.load(Ordering::Relaxed) > now_unix_millis()
+    }
+
+    /// Whether the breaker was ever tripped, without clearing it.
+    fn has_tripped(&self) -> bool {
+        self.unavailable_until.load(Ordering::Relaxed) != 0
+    }
+
+    fn trip(&self) {
+        let until = now_unix_millis() + self.cooldown.as_millis() as u64;
+        self.unavailable_until.store(until, Ordering::Relaxed);
+    }
+
+    fn clear(&self) {
+        self.unavailable_until.store(0, Ordering::Relaxed);
+    }
+
+    /// Rewrite a primary object location into its mirror location.
+    fn rewrite(&self, location: &ParsedOssUrl) -> Result<ParsedOssUrl> {
+        let bucket = self
+            .bucket
+            .clone()
+            .unwrap_or_else(|| location.bucket.clone());
+        let key = if self.key_prefix.is_empty() {
+            location.key.clone()
+        } else if self.primary_key_prefix.is_empty() {
+            format!("{}/{}", self.key_prefix, location.key)
+        } else {
+            let primary_prefix = format!("{}/", self.primary_key_prefix);
+            let rest = location
+                .key
+                .strip_prefix(&primary_prefix)
+                .unwrap_or(location.key.as_str());
+            format!("{}/{}", self.key_prefix, rest)
+        };
+        let addressing_style = match self.addressing_override {
+            Some(style) => style,
+            None => detect_addressing_style(&self.endpoint, &bucket)?,
+        };
+        Ok(ParsedOssUrl {
+            bucket,
+            key,
+            region: self.region.clone(),
+            endpoint: self.endpoint.clone(),
+            addressing_style,
+        })
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether a key names immutable, content-addressed data (a managed layer).
+///
+/// Only these reads may fall back on `NotFound`; mutable catalog/volume records
+/// must never be served from a stale mirror, which could resurrect deleted
+/// state or roll back a head.
+fn is_immutable_key(key: &str) -> bool {
+    let key = key.trim_start_matches('/');
+    key.starts_with("managed-layers/") || key.contains("/managed-layers/")
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +152,7 @@ struct ParsedOssUrl {
 pub struct OssFile {
     backend: Arc<OssBackendInner>,
     location: ParsedOssUrl,
+    fallback_location: Option<ParsedOssUrl>,
     size_cache: Mutex<Option<u64>>,
 }
 
@@ -84,6 +178,11 @@ impl OssBackend {
         } else {
             config.retry_count
         };
+        let fallback = config
+            .fallback
+            .as_ref()
+            .map(|fallback| build_fallback_runtime(fallback, &credential_source))
+            .transpose()?;
 
         Ok(Self {
             inner: Arc::new(OssBackendInner {
@@ -93,6 +192,7 @@ impl OssBackend {
                 addressing_override,
                 timeout,
                 retry_count,
+                fallback,
                 cached_operators: RwLock::new(HashMap::new()),
             }),
         })
@@ -109,10 +209,15 @@ impl OssBackend {
             &self.inner.default_region,
             self.inner.addressing_override,
         )?;
+        let fallback_location = match self.inner.fallback.as_ref() {
+            Some(fallback) => Some(fallback.rewrite(&location)?),
+            None => None,
+        };
 
         Ok(Arc::new(OssFile {
             backend: Arc::clone(&self.inner),
             location,
+            fallback_location,
             size_cache: Mutex::new(size_hint),
         }))
     }
@@ -323,12 +428,27 @@ impl OssBackendInner {
     async fn run_with_operator<T, F, Fut>(&self, location: &ParsedOssUrl, operation: F) -> Result<T>
     where
         F: Fn(Operator) -> Fut,
-        Fut: std::future::Future<Output = OpenDalResult<T>>,
+        Fut: Future<Output = OpenDalResult<T>>,
     {
-        let current = self.ensure_fresh_operator(location).await?;
-        let config = location.operator_config(self.timeout, self.retry_count);
-        let credentials = current.credential().is_some().then_some(&self.credentials);
-        let (value, refreshed) = run_with_refresh(&current, credentials, &config, operation)
+        self.run_operation(location, &self.credentials, self.timeout, operation)
+            .await
+    }
+
+    async fn run_operation<T, F, Fut>(
+        &self,
+        location: &ParsedOssUrl,
+        credentials: &CachedCredentialSource,
+        timeout: Duration,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: Fn(Operator) -> Fut,
+        Fut: Future<Output = OpenDalResult<T>>,
+    {
+        let current = self.ensure_fresh_operator(location, credentials).await?;
+        let config = location.operator_config(timeout, self.retry_count);
+        let refresh = current.credential().is_some().then_some(credentials);
+        let (value, refreshed) = run_with_refresh(&current, refresh, &config, operation)
             .await
             .map_err(map_object_store_operator_error)?;
         if let Some(refreshed) = refreshed {
@@ -340,11 +460,101 @@ impl OssBackendInner {
         Ok(value)
     }
 
+    /// Run a read operation, failing over to the mirror when the primary is
+    /// unavailable (or, for immutable content-addressed keys, not found).
+    ///
+    /// The breaker short-circuits the primary attempt for the cooldown window
+    /// after an unavailability error, so a burst of reads does not each pay a
+    /// connect timeout.
+    async fn run_read<T, F, Fut>(
+        &self,
+        location: &ParsedOssUrl,
+        fallback_location: Option<&ParsedOssUrl>,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: Fn(Operator) -> Fut + Clone,
+        Fut: Future<Output = OpenDalResult<T>>,
+    {
+        let Some(fallback) = self.fallback.as_ref() else {
+            return self.run_with_operator(location, operation).await;
+        };
+        let Some(fallback_location) = fallback_location else {
+            return self.run_with_operator(location, operation).await;
+        };
+        let action = location.key.rsplit('/').next().unwrap_or(&location.key);
+
+        if !fallback.is_tripped() {
+            let probe = self
+                .run_operation(
+                    location,
+                    &self.credentials,
+                    fallback.primary_timeout,
+                    operation.clone(),
+                )
+                .await;
+            match probe {
+                Ok(value) => {
+                    if fallback.has_tripped() {
+                        fallback.clear();
+                        info!(
+                            bucket = %location.bucket,
+                            endpoint = %location.endpoint,
+                            "oss primary recovered; routing reads back to the primary"
+                        );
+                    }
+                    return Ok(value);
+                }
+                Err(error) if is_unavailable_error(&error) => {
+                    fallback.trip();
+                    warn!(
+                        bucket = %location.bucket,
+                        endpoint = %location.endpoint,
+                        error = %error,
+                        "oss primary unavailable; routing reads to the fallback mirror"
+                    );
+                }
+                Err(error) if is_immutable_key(&location.key) && is_not_found_error(&error) => {
+                    warn!(
+                        bucket = %location.bucket,
+                        endpoint = %location.endpoint,
+                        key = %location.key,
+                        "oss primary is missing an immutable object; trying the fallback mirror"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let result = self
+            .run_operation(
+                fallback_location,
+                &fallback.credentials,
+                self.timeout,
+                operation,
+            )
+            .await;
+        if result.is_ok() {
+            ::metrics::counter!(
+                "agentenv_overlaybd_oss_fallback_reads_total",
+                "action" => action.to_string(),
+            )
+            .increment(1);
+        }
+        result.with_context(|| {
+            format!(
+                "read object '{}' from fallback endpoint {} failed",
+                location.key, fallback_location.endpoint
+            )
+        })
+    }
+
     async fn ensure_fresh_operator(
         &self,
         location: &ParsedOssUrl,
+        credentials: &CachedCredentialSource,
     ) -> Result<OperatorWithCredential> {
-        let credential = self.credentials.current().await?;
+        let credential = credentials.current().await?;
         let cache_key = location.cache_key();
 
         {
@@ -397,10 +607,14 @@ impl VirtualFile for OssFile {
         let start = Instant::now();
         let result = self
             .backend
-            .run_with_operator(&self.location, |operator| {
-                let key = key.clone();
-                async move { operator.read_with(&key).range(offset..end).await }
-            })
+            .run_read(
+                &self.location,
+                self.fallback_location.as_ref(),
+                |operator| {
+                    let key = key.clone();
+                    async move { operator.read_with(&key).range(offset..end).await }
+                },
+            )
             .await
             .with_context(|| {
                 format!(
@@ -440,26 +654,30 @@ impl VirtualFile for OssFile {
         // operator side (which may refresh credentials) to the plain write
         // loop here, so no &mut escapes any closure.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
-        let read_fut = self.backend.run_with_operator(&self.location, |operator| {
-            let key = key.clone();
-            let tx = tx.clone();
-            async move {
-                let reader = operator.reader(&key).await?;
-                let mut stream = reader.into_bytes_stream(offset..end).await?;
-                while let Some(chunk) = stream.try_next().await.map_err(|err| {
-                    OpenDalError::new(
-                        OpenDalErrorKind::Unexpected,
-                        "stream read from oss object failed",
-                    )
-                    .set_source(err)
-                })? {
-                    if tx.send(chunk).await.is_err() {
-                        break;
+        let read_fut = self.backend.run_read(
+            &self.location,
+            self.fallback_location.as_ref(),
+            |operator| {
+                let key = key.clone();
+                let tx = tx.clone();
+                async move {
+                    let reader = operator.reader(&key).await?;
+                    let mut stream = reader.into_bytes_stream(offset..end).await?;
+                    while let Some(chunk) = stream.try_next().await.map_err(|err| {
+                        OpenDalError::new(
+                            OpenDalErrorKind::Unexpected,
+                            "stream read from oss object failed",
+                        )
+                        .set_source(err)
+                    })? {
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
-        });
+            },
+        );
         let write_fut = async {
             let mut written = 0usize;
             while let Some(chunk) = rx.recv().await {
@@ -503,10 +721,14 @@ impl VirtualFile for OssFile {
         let start = Instant::now();
         let result = self
             .backend
-            .run_with_operator(&self.location, |operator| {
-                let key = key.clone();
-                async move { operator.stat(&key).await }
-            })
+            .run_read(
+                &self.location,
+                self.fallback_location.as_ref(),
+                |operator| {
+                    let key = key.clone();
+                    async move { operator.stat(&key).await }
+                },
+            )
             .await
             .with_context(|| format!("stat oss object '{}'", self.location.key));
         crate::metrics::record_remote_metadata(
@@ -725,6 +947,100 @@ fn credential_source_from_config(config: &OssConfig) -> Result<CredentialSource>
     )
 }
 
+/// Build the mirror runtime from its config, reusing the primary credentials
+/// unless the fallback configures its own.
+fn build_fallback_runtime(
+    fallback: &OssFallbackConfig,
+    primary_credentials: &CredentialSource,
+) -> Result<FallbackRuntime> {
+    let has_own_credentials = !fallback.access_key_id.trim().is_empty()
+        || !fallback.secret_access_key.trim().is_empty()
+        || !fallback.security_token.trim().is_empty()
+        || !fallback.credential_process.trim().is_empty();
+    let credentials = if has_own_credentials {
+        credential_source_from_fields(
+            CredentialFields {
+                access_key_id: Some(fallback.access_key_id.as_str()),
+                secret_access_key: Some(fallback.secret_access_key.as_str()),
+                security_token: Some(fallback.security_token.as_str()),
+                credential_process: Some(fallback.credential_process.as_str()),
+            },
+            CredentialSourceOptions {
+                scope: "oss.fallback",
+                allow_anonymous: true,
+                required_access_key_id_label: "ossConfig.fallback.accessKeyId",
+                required_secret_access_key_label: "ossConfig.fallback.secretAccessKey",
+            },
+        )?
+    } else {
+        primary_credentials.clone()
+    };
+
+    let bucket = fallback.bucket.trim();
+    Ok(FallbackRuntime {
+        endpoint: fallback.endpoint.trim().to_string(),
+        region: fallback.region.trim().to_string(),
+        bucket: (!bucket.is_empty()).then(|| bucket.to_string()),
+        primary_key_prefix: fallback
+            .primary_key_prefix
+            .trim()
+            .trim_matches('/')
+            .to_string(),
+        key_prefix: fallback.key_prefix.trim().trim_matches('/').to_string(),
+        addressing_override: parse_addressing_style(&fallback.addressing_style)?,
+        credentials: CachedCredentialSource::new(credentials),
+        cooldown: fallback.cooldown(),
+        primary_timeout: fallback.primary_timeout(),
+        unavailable_until: AtomicU64::new(0),
+    })
+}
+
+/// Whether an error means the primary endpoint could not be reached at all, as
+/// opposed to a definitive response (auth failure, precondition, not found).
+fn is_unavailable_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(opendal_error) = cause.downcast_ref::<OpenDalError>() {
+            return is_unavailable_kind(opendal_error.kind());
+        }
+        if let Some(ObjectStoreOperatorError::OpenDal(opendal_error)) =
+            cause.downcast_ref::<ObjectStoreOperatorError>()
+        {
+            return is_unavailable_kind(opendal_error.kind());
+        }
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
+            return true;
+        }
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+            return reqwest_error.is_timeout() || reqwest_error.is_connect();
+        }
+        false
+    })
+}
+
+fn is_unavailable_kind(kind: OpenDalErrorKind) -> bool {
+    matches!(
+        kind,
+        OpenDalErrorKind::Unexpected | OpenDalErrorKind::RateLimited
+    )
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(opendal_error) = cause.downcast_ref::<OpenDalError>() {
+            return opendal_error.kind() == OpenDalErrorKind::NotFound;
+        }
+        if let Some(ObjectStoreOperatorError::OpenDal(opendal_error)) =
+            cause.downcast_ref::<ObjectStoreOperatorError>()
+        {
+            return opendal_error.kind() == OpenDalErrorKind::NotFound;
+        }
+        false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,10 +1085,116 @@ mod tests {
             default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
+            fallback: None,
         };
 
         let err = credential_source_from_config(&config).expect_err("mixed source should fail");
         assert!(err.to_string().contains("credential_process"));
+    }
+
+    #[test]
+    fn immutable_key_classification_matches_managed_layers_only() {
+        assert!(is_immutable_key("managed-layers/sha256:abc"));
+        assert!(is_immutable_key("snapshots/managed-layers/sha256:abc"));
+        assert!(!is_immutable_key("catalog/records/abc.json"));
+        assert!(!is_immutable_key("volumes/records/vol.json"));
+        assert!(!is_immutable_key("snapshots/catalog/aliases/app.json"));
+    }
+
+    #[test]
+    fn fallback_rewrite_swaps_bucket_endpoint_and_prefix() {
+        let runtime = build_fallback_runtime(
+            &OssFallbackConfig {
+                endpoint: "http://mirror:9000".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "mirror-bucket".to_string(),
+                primary_key_prefix: "snapshots".to_string(),
+                key_prefix: "replica".to_string(),
+                ..Default::default()
+            },
+            &CredentialSource::Anonymous,
+        )
+        .expect("build fallback runtime");
+
+        let primary = ParsedOssUrl {
+            bucket: "primary-bucket".to_string(),
+            key: "snapshots/managed-layers/sha256:abc".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: "http://primary:9000".to_string(),
+            addressing_style: AddressingStyle::Path,
+        };
+        let rewritten = runtime.rewrite(&primary).expect("rewrite");
+        assert_eq!(rewritten.bucket, "mirror-bucket");
+        assert_eq!(rewritten.endpoint, "http://mirror:9000");
+        assert_eq!(rewritten.key, "replica/managed-layers/sha256:abc");
+    }
+
+    #[test]
+    fn fallback_rewrite_keeps_keys_when_no_prefix_rewrite_configured() {
+        let runtime = build_fallback_runtime(
+            &OssFallbackConfig {
+                endpoint: "http://mirror:9000".to_string(),
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            },
+            &CredentialSource::Anonymous,
+        )
+        .expect("build fallback runtime");
+
+        let primary = ParsedOssUrl {
+            bucket: "primary-bucket".to_string(),
+            key: "snapshots/managed-layers/sha256:abc".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: "http://primary:9000".to_string(),
+            addressing_style: AddressingStyle::Path,
+        };
+        let rewritten = runtime.rewrite(&primary).expect("rewrite");
+        // Same-key replication: bucket defaults to the URL bucket, key unchanged.
+        assert_eq!(rewritten.bucket, "primary-bucket");
+        assert_eq!(rewritten.key, "snapshots/managed-layers/sha256:abc");
+    }
+
+    #[test]
+    fn breaker_trips_and_expires() {
+        let runtime = build_fallback_runtime(
+            &OssFallbackConfig {
+                endpoint: "http://mirror:9000".to_string(),
+                region: "us-east-1".to_string(),
+                cooldown_secs: 1,
+                ..Default::default()
+            },
+            &CredentialSource::Anonymous,
+        )
+        .expect("build fallback runtime");
+
+        assert!(!runtime.is_tripped());
+        assert!(!runtime.has_tripped());
+        runtime.trip();
+        assert!(runtime.is_tripped());
+        assert!(runtime.has_tripped());
+        runtime.clear();
+        assert!(!runtime.is_tripped());
+        assert!(!runtime.has_tripped());
+    }
+
+    #[test]
+    fn unavailable_error_classification_excludes_definitive_responses() {
+        let unavailable = anyhow::Error::from(ObjectStoreOperatorError::OpenDal(
+            OpenDalError::new(OpenDalErrorKind::Unexpected, "connect refused"),
+        ));
+        assert!(is_unavailable_error(&unavailable));
+
+        let rate_limited = anyhow::Error::from(ObjectStoreOperatorError::OpenDal(
+            OpenDalError::new(OpenDalErrorKind::RateLimited, "slow down"),
+        ));
+        assert!(is_unavailable_error(&rate_limited));
+
+        let denied = anyhow::Error::from(ObjectStoreOperatorError::OpenDal(OpenDalError::new(
+            OpenDalErrorKind::PermissionDenied,
+            "403",
+        )));
+        assert!(!is_unavailable_error(&denied));
+        assert!(!is_unavailable_error(&anyhow::anyhow!("plain error")));
     }
 
     #[test]

@@ -794,6 +794,118 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
             bail!("backend.oss requires non-anonymous credentials");
         }
     }
+
+    if let Some(fallback) = oss.fallback.as_ref() {
+        config["fallback"] = overlaybd_runtime_oss_fallback(fallback, oss.prefix.as_deref())?;
+    }
+    Ok(config)
+}
+
+/// Build the OverlayBD runtime `ossConfig.fallback` object for the mirror.
+///
+/// The runtime reads content-addressed managed layer blobs directly from the
+/// endpoint, so it needs the mirror endpoint/region/credentials and the key
+/// layout mapping (primary prefix -> mirror prefix). Credentials are omitted
+/// when the fallback does not configure its own, and the runtime then reuses the
+/// primary credentials.
+fn overlaybd_runtime_oss_fallback(
+    fallback: &crate::cfg::OssFallbackConfig,
+    primary_prefix: Option<&str>,
+) -> Result<serde_json::Value> {
+    let region = fallback
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .context("backend.oss.fallback.region must be set when generating overlaybd OSS config")?;
+    let addressing_style = match fallback.addressing_style {
+        Some(OssAddressingStyle::Path) => "path",
+        Some(OssAddressingStyle::Virtual) => "virtual",
+        None => "",
+    };
+    let primary_prefix = primary_prefix
+        .map(str::trim)
+        .unwrap_or("")
+        .trim_matches('/');
+    let key_prefix = fallback
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .trim_matches('/');
+
+    let mut config = serde_json::json!({
+        "endpoint": fallback.endpoint.trim(),
+        "region": region,
+        // Empty bucket keeps the bucket named in the object URL, which is the
+        // same-key replication layout.
+        "bucket": fallback.bucket.trim(),
+        // Only a real prefix change needs a rewrite; identical prefixes (the
+        // same-key replication layout) leave the key untouched.
+        "primaryKeyPrefix": if key_prefix.is_empty() { "" } else { primary_prefix },
+        "keyPrefix": key_prefix,
+        "addressingStyle": addressing_style,
+    });
+    if fallback.cooldown_secs.is_some() {
+        config["cooldownSecs"] = fallback.cooldown_secs.unwrap_or_default().into();
+    }
+    if fallback.primary_timeout_secs.is_some() {
+        config["primaryTimeoutSecs"] = fallback.primary_timeout_secs.unwrap_or_default().into();
+    }
+
+    let has_own_credentials = fallback
+        .access_key_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || fallback
+            .access_key_secret
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || fallback
+            .security_token
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || fallback
+            .credential_process
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+    if has_own_credentials {
+        let credential_source = credential_source_from_fields(
+            CredentialFields {
+                access_key_id: fallback.access_key_id.as_deref(),
+                secret_access_key: fallback.access_key_secret.as_deref(),
+                security_token: fallback.security_token.as_deref(),
+                credential_process: fallback.credential_process.as_deref(),
+            },
+            CredentialSourceOptions {
+                scope: "backend.oss.fallback",
+                allow_anonymous: false,
+                required_access_key_id_label: "backend.oss.fallback.access_key_id",
+                required_secret_access_key_label: "backend.oss.fallback.access_key_secret",
+            },
+        )?;
+        match credential_source {
+            CredentialSource::Static(credential) => {
+                config["accessKeyId"] = credential.access_key_id.into();
+                config["secretAccessKey"] = credential.secret_access_key.into();
+                config["securityToken"] = credential.security_token.unwrap_or_default().into();
+                config["credentialProcess"] = "".into();
+            }
+            CredentialSource::Process { command } => {
+                config["accessKeyId"] = "".into();
+                config["secretAccessKey"] = "".into();
+                config["securityToken"] = "".into();
+                config["credentialProcess"] = command.into();
+            }
+            CredentialSource::Anonymous => {
+                bail!("backend.oss.fallback requires non-anonymous credentials");
+            }
+        }
+    }
     Ok(config)
 }
 
@@ -838,6 +950,7 @@ mod tests {
             region: Some(" cn-hangzhou ".to_string()),
             addressing_style: None,
             cache_max_size_gb: Some(4),
+            fallback: None,
         }
     }
 
@@ -925,6 +1038,103 @@ mod tests {
         let err =
             overlaybd_runtime_oss_config(&oss).expect_err("blank static credential should fail");
         assert!(err.to_string().contains("backend.oss.access_key_id"));
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_omits_fallback_when_absent() {
+        let config = overlaybd_runtime_oss_config(&sample_oss_config())
+            .expect("derive overlaybd oss config");
+        assert!(config.get("fallback").is_none());
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_emits_fallback_with_key_layout() {
+        use crate::cfg::{OssAddressingStyle, OssFallbackConfig};
+
+        let mut oss = sample_oss_config();
+        oss.prefix = Some("snapshots".to_string());
+        oss.fallback = Some(OssFallbackConfig {
+            endpoint: " https://mirror.example ".to_string(),
+            bucket: " mirror-bucket ".to_string(),
+            prefix: Some(" replica ".to_string()),
+            credential_process: None,
+            access_key_id: Some(" mak ".to_string()),
+            access_key_secret: Some(" msk ".to_string()),
+            security_token: None,
+            region: Some(" us-east-1 ".to_string()),
+            addressing_style: Some(OssAddressingStyle::Path),
+            cooldown_secs: Some(10),
+            primary_timeout_secs: Some(2),
+        });
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        let fallback = &config["fallback"];
+        assert_eq!(fallback["endpoint"], "https://mirror.example");
+        assert_eq!(fallback["region"], "us-east-1");
+        assert_eq!(fallback["bucket"], "mirror-bucket");
+        assert_eq!(fallback["primaryKeyPrefix"], "snapshots");
+        assert_eq!(fallback["keyPrefix"], "replica");
+        assert_eq!(fallback["addressingStyle"], "path");
+        assert_eq!(fallback["accessKeyId"], "mak");
+        assert_eq!(fallback["secretAccessKey"], "msk");
+        assert_eq!(fallback["cooldownSecs"], 10);
+        assert_eq!(fallback["primaryTimeoutSecs"], 2);
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_fallback_inherits_primary_credentials() {
+        use crate::cfg::OssFallbackConfig;
+
+        let mut oss = sample_oss_config();
+        oss.fallback = Some(OssFallbackConfig {
+            endpoint: "https://mirror.example".to_string(),
+            bucket: "mirror-bucket".to_string(),
+            prefix: None,
+            credential_process: None,
+            access_key_id: None,
+            access_key_secret: None,
+            security_token: None,
+            region: Some("us-east-1".to_string()),
+            addressing_style: None,
+            cooldown_secs: None,
+            primary_timeout_secs: None,
+        });
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        let fallback = &config["fallback"];
+        // Same-key replication: no bucket override and no key rewrite.
+        assert_eq!(fallback["bucket"], "");
+        assert_eq!(fallback["keyPrefix"], "");
+        assert_eq!(fallback["primaryKeyPrefix"], "");
+        // Credentials omitted; the runtime reuses the primary ones.
+        assert!(fallback.get("accessKeyId").is_none());
+        assert!(fallback.get("cooldownSecs").is_none());
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_fallback_requires_region() {
+        use crate::cfg::OssFallbackConfig;
+
+        let mut oss = sample_oss_config();
+        oss.fallback = Some(OssFallbackConfig {
+            endpoint: "https://mirror.example".to_string(),
+            bucket: "mirror-bucket".to_string(),
+            prefix: None,
+            credential_process: None,
+            access_key_id: None,
+            access_key_secret: None,
+            security_token: None,
+            region: None,
+            addressing_style: None,
+            cooldown_secs: None,
+            primary_timeout_secs: None,
+        });
+
+        let err =
+            overlaybd_runtime_oss_config(&oss).expect_err("fallback without region must fail");
+        assert!(err
+            .to_string()
+            .contains("backend.oss.fallback.region must be set"));
     }
 
     #[test]

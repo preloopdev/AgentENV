@@ -191,6 +191,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         region: Some(fixture.region.clone()),
         addressing_style: None,
         cache_max_size_gb: Some(1),
+        fallback: None,
     }
 }
 

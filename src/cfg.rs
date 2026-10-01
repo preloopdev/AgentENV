@@ -407,6 +407,40 @@ pub struct OssBackendConfig {
     #[serde(alias = "addressingStyle", alias = "addressing-style")]
     pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
+    /// Optional read-only fallback endpoint (durable mirror). Absent means the
+    /// backend behaves exactly as before.
+    #[serde(alias = "fallback_endpoint")]
+    pub fallback: Option<OssFallbackConfig>,
+}
+
+/// Read-only mirror for the OSS repository backend.
+///
+/// Reads fall back to this endpoint when the primary is unreachable. Writes and
+/// conditional writes always stay on the primary. Immutable content-addressed
+/// objects (managed layer blobs) also fall back on `NotFound`; mutable records
+/// never do, so a stale mirror cannot resurrect deleted state.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OssFallbackConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: Option<String>,
+    #[serde(alias = "credentialProcess", alias = "credential-process")]
+    pub credential_process: Option<String>,
+    pub access_key_id: Option<String>,
+    pub access_key_secret: Option<String>,
+    pub security_token: Option<String>,
+    pub region: Option<String>,
+    #[serde(alias = "addressingStyle", alias = "addressing-style")]
+    pub addressing_style: Option<OssAddressingStyle>,
+    /// Seconds to keep routing reads to the mirror after the primary fails,
+    /// before probing the primary again. Defaults to 30.
+    #[serde(alias = "cooldownSecs")]
+    pub cooldown_secs: Option<u64>,
+    /// Per-request timeout in seconds for primary reads while a fallback is
+    /// configured, so failover does not wait out the client's default timeout.
+    /// Defaults to 5.
+    #[serde(alias = "primaryTimeoutSecs")]
+    pub primary_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]

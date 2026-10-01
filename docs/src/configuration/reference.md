@@ -472,6 +472,93 @@ region = "auto"
 addressing_style = "virtual"
 ```
 
+### `[backend.oss.fallback]` (read-only mirror)
+
+Optional read-only mirror for the OSS backend. A site that runs a single
+RustFS (or other S3-compatible) store as its primary object store can replicate
+its bucket asynchronously to a durable mirror and point AgentENV here. When the
+primary is unreachable, reads are served from the mirror; when it is absent, the
+backend behaves exactly as before.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `endpoint` | string | none | Mirror endpoint URL. Required when the section is present |
+| `bucket` | string | none | Mirror bucket name. Required |
+| `prefix` | string | empty | Object key prefix under the mirror bucket. Defaults to the same key layout when empty |
+| `region` | string | none | Region for the mirror, same rules as the primary |
+| `credential_process` | string | unset | Credential command for the mirror. When no mirror credential is configured, the primary credentials are reused |
+| `access_key_id` | string | unset | Static mirror access key ID |
+| `access_key_secret` | string | unset | Static mirror access key secret |
+| `security_token` | string | unset | Optional session token paired with static mirror credentials |
+| `addressing_style` | string | auto-detect | Bucket addressing style for the mirror, `"virtual"` or `"path"` |
+| `cooldown_secs` | integer | `30` | Seconds to keep routing reads to the mirror after the primary fails, before probing the primary again |
+| `primary_timeout_secs` | integer | `5` | Per-request timeout for primary reads while a fallback is configured, so failover does not wait out the client's default timeout |
+
+Read/write semantics:
+
+- **Reads** (`GET`, ranged `GET`, `HEAD`/`stat`, and `LIST` used for catalog
+  discovery) try the primary first and fall back to the mirror when the primary
+  is unavailable: connection refused/reset, DNS failure, timeout, HTTP 5xx, or
+  OpenDAL errors classified as unexpected/transient. Auth failures (`403`) and
+  precondition failures never fall back.
+- **`NotFound`** on the primary falls back **only** for immutable,
+  content-addressed managed layer blobs (`managed-layers/<digest>`). Mutable
+  objects — snapshot records, volume records and aliases, catalog heads, and
+  per-snapshot artifacts — never fall back on `NotFound`, so a stale mirror
+  cannot resurrect deleted or garbage-collected state or roll back a head.
+- **Writes and deletes** (`PUT`, conditional `PUT`, multipart `PUT`, `DELETE`)
+  always go to the primary. Conditional-write correctness (`If-Match` /
+  `If-None-Match` compare-and-swap) is evaluated against the primary only. When
+  the primary is down, writes fail exactly as they did before this feature.
+- **Circuit breaker**: after a primary unavailability error, reads route to the
+  mirror for `cooldown_secs` before the primary is probed again, so a burst of
+  reads does not each pay a connect timeout.
+- Data-integrity checks the primary path performs (sizes, digests, ETags) also
+  apply to mirror reads.
+- Every failover transition (primary → mirror and mirror → primary) is logged at
+  `warn`/`info` with the error cause, and mirror reads are counted under
+  `agentenv_snapshot_oss_fallback_reads_total`.
+
+Example:
+
+```toml
+[backend.oss]
+endpoint = "http://rustfs.site-a.lan:9000"
+bucket = "agentenv-snapshots"
+region = "us-east-1"
+prefix = "snapshots"
+access_key_id = "..."
+access_key_secret = "..."
+
+[backend.oss.fallback]
+endpoint = "https://s3.durable-mirror.example"
+bucket = "agentenv-mirror-site-a"
+region = "us-east-1"
+prefix = "snapshots"
+access_key_id = "..."
+access_key_secret = "..."
+cooldown_secs = 30
+primary_timeout_secs = 5
+```
+
+**Known limitations**
+
+- The mirror lags the primary because replication is asynchronous. A mirror may
+  hold a volume or snapshot record whose newest layer has not replicated yet; a
+  read of that missing layer then fails cleanly with an
+  `ArtifactNotFound`-style error rather than hanging or returning partial data.
+- The mirror is a replication of the primary bucket. When the primary is
+  rebuilt empty, reads of mutable records correctly report `NotFound` (they are
+  not served from the mirror), while immutable managed layers are still readable
+  from the mirror. Rebuilding a site therefore restores read-only access to
+  layer bytes, not to the mutable catalog.
+- OverlayBD reads the managed layer **blobs** directly from an
+  S3 endpoint, not through this repository client. The generated OverlayBD
+  runtime config (`ossConfig.fallback`) mirrors these semantics: it reads from
+  the primary endpoint and, on unavailability, from the fallback endpoint
+  (`ossConfig.fallback.endpoint`), while its uploads and existence probes stay
+  on the primary. See the note on `global_config_path` below.
+
 Other path override:
 
 - `AENV_DEPS_PATH`
@@ -528,7 +615,8 @@ The file at the configured default path
 `$AENV_HOME/overlaybd/overlaybd-global.json` is **auto-generated** by the server
 at startup. The generated JSON incorporates several TOML settings —
 `[image.cache].root_dir`, `[image.cache.remote_blocks].max_size_gb`,
-`download_enable`, `[backend.oss]` credentials, and Docker registry credentials
+`download_enable`, `[backend.oss]` credentials (including
+`[backend.oss.fallback]`), and Docker registry credentials
 detected from `~/.docker/config.json` — into a single overlaybd runtime config
 file.
 

@@ -78,13 +78,14 @@ impl OssBackend {
     ) -> Result<Self> {
         let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
         let managed_layers_repo_blob_url = config.managed_layers_repo_blob_url();
-        let client = Arc::new(OssClient::new(
+        let client = Arc::new(OssClient::new_with_fallback(
             config.bucket().to_string(),
             config.endpoint().to_string(),
             config.region().to_string(),
             config.prefix().to_string(),
             config.credential_source(),
             config.addressing_style(),
+            config.fallback(),
         )?);
 
         let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(

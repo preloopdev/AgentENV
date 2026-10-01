@@ -82,13 +82,14 @@ impl SnapshotImageService {
                         SnapshotImageStoragePolicy::ObjectStorage
                     };
                     let config = oss::NormalizedOssConfig::new(oss_config, policy)?;
-                    let client = Arc::new(oss::OssClient::new(
+                    let client = Arc::new(oss::OssClient::new_with_fallback(
                         config.bucket().to_string(),
                         config.endpoint().to_string(),
                         config.region().to_string(),
                         config.prefix().to_string(),
                         config.credential_source(),
                         config.addressing_style(),
+                        config.fallback(),
                     )?);
                     let repository = Arc::new(oss::OssSnapshotRepository::new(
                         Arc::clone(&client),

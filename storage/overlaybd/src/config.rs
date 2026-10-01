@@ -218,6 +218,10 @@ pub struct OssConfig {
     pub timeout_secs: u64,
     /// Number of retries on transient failures. Default 3.
     pub retry_count: u32,
+    /// Optional read-only fallback endpoint (durable mirror). When unset the
+    /// runtime reads only from `default_endpoint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<OssFallbackConfig>,
 }
 
 impl Default for OssConfig {
@@ -233,9 +237,75 @@ impl Default for OssConfig {
             default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
+            fallback: None,
         }
     }
 }
+
+/// Read-only fallback for the OverlayBD object-store backend.
+///
+/// The runtime reads content-addressed managed layers directly from an S3
+/// endpoint. When the primary is unreachable it retries those reads against
+/// this mirror. Writes (`upload_*`) and existence probes (`object_size`) always
+/// stay on the primary, so a stale mirror can never make the runtime skip an
+/// upload or resurrect deleted data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OssFallbackConfig {
+    /// Endpoint URL of the mirror. Required when a fallback is configured.
+    pub endpoint: String,
+    /// Region of the mirror. Required when a fallback is configured.
+    pub region: String,
+    /// Bucket to read from on the mirror; empty keeps the bucket in the URL.
+    pub bucket: String,
+    /// Key prefix the primary URL layout carries. Stripped before applying
+    /// `key_prefix`. Empty means the URL key is used unchanged.
+    pub primary_key_prefix: String,
+    /// Key prefix to apply on the mirror. Empty keeps the primary prefix, which
+    /// is the layout produced by same-key replication.
+    pub key_prefix: String,
+    /// Bucket addressing style: `"virtual"`, `"path"`, or empty for
+    /// endpoint-based auto-detection.
+    pub addressing_style: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub security_token: String,
+    pub credential_process: String,
+    /// Seconds to keep routing reads to the mirror after the primary fails,
+    /// before probing the primary again. 0 uses the default (30).
+    pub cooldown_secs: u64,
+    /// Per-request timeout in seconds for primary reads while a fallback is
+    /// configured, so failover does not wait out `timeoutSecs`. 0 uses the
+    /// default (5).
+    pub primary_timeout_secs: u64,
+}
+
+impl OssFallbackConfig {
+    /// Effective cooldown before probing the primary again.
+    pub fn cooldown(&self) -> std::time::Duration {
+        let secs = if self.cooldown_secs == 0 {
+            DEFAULT_FALLBACK_COOLDOWN_SECS
+        } else {
+            self.cooldown_secs
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Effective per-request timeout for primary reads.
+    pub fn primary_timeout(&self) -> std::time::Duration {
+        let secs = if self.primary_timeout_secs == 0 {
+            DEFAULT_FALLBACK_PRIMARY_TIMEOUT_SECS
+        } else {
+            self.primary_timeout_secs
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
+
+/// Cooldown applied when `OssFallbackConfig::cooldown_secs` is left unset.
+pub const DEFAULT_FALLBACK_COOLDOWN_SECS: u64 = 30;
+/// Primary read timeout applied when `primary_timeout_secs` is left unset.
+pub const DEFAULT_FALLBACK_PRIMARY_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
@@ -657,6 +727,39 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
             "ossConfig.defaultAddressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
             cfg.oss_config.default_addressing_style
         );
+
+        if let Some(fallback) = &cfg.oss_config.fallback {
+            ensure!(
+                !fallback.endpoint.trim().is_empty(),
+                "ossConfig.fallback.endpoint cannot be empty when a fallback is configured"
+            );
+            ensure!(
+                !fallback.region.trim().is_empty(),
+                "ossConfig.fallback.region cannot be empty when a fallback is configured"
+            );
+            ensure!(
+                matches!(fallback.addressing_style.trim(), "" | "virtual" | "path"),
+                "ossConfig.fallback.addressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
+                fallback.addressing_style
+            );
+            ensure!(
+                fallback.access_key_id.is_empty() == fallback.secret_access_key.is_empty(),
+                "ossConfig.fallback.accessKeyId and ossConfig.fallback.secretAccessKey must be set together"
+            );
+            ensure!(
+                fallback.credential_process.trim().is_empty()
+                    || (fallback.access_key_id.is_empty()
+                        && fallback.secret_access_key.is_empty()
+                        && fallback.security_token.is_empty()),
+                "ossConfig.fallback.credentialProcess cannot be combined with fallback static credentials"
+            );
+            ensure!(
+                fallback.security_token.is_empty()
+                    || (!fallback.access_key_id.is_empty()
+                        && !fallback.secret_access_key.is_empty()),
+                "ossConfig.fallback.securityToken requires fallback accessKeyId and secretAccessKey"
+            );
+        }
     }
 
     Ok(())
@@ -983,6 +1086,124 @@ mod tests {
         cfg.normalize_compat_fields();
         let err = validate_global_config(&cfg).expect_err("should fail");
         assert!(err.to_string().contains("securityToken"));
+    }
+
+    #[test]
+    fn test_oss_config_parses_optional_fallback() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "http://primary:9000",
+            "defaultRegion": "us-east-1",
+            "accessKeyId": "ak",
+            "secretAccessKey": "sk",
+            "fallback": {
+              "endpoint": "http://mirror:9000",
+              "region": "us-east-1",
+              "bucket": "mirror-bucket",
+              "primaryKeyPrefix": "snapshots",
+              "keyPrefix": "replica"
+            }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        validate_global_config(&cfg).expect("fallback config should validate");
+
+        let fallback = cfg.oss_config.fallback.expect("fallback parsed");
+        assert_eq!(fallback.endpoint, "http://mirror:9000");
+        assert_eq!(fallback.bucket, "mirror-bucket");
+        assert_eq!(fallback.primary_key_prefix, "snapshots");
+        assert_eq!(fallback.key_prefix, "replica");
+        assert_eq!(fallback.cooldown().as_secs(), 30);
+        assert_eq!(fallback.primary_timeout().as_secs(), 5);
+    }
+
+    #[test]
+    fn test_oss_config_omits_absent_fallback() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "http://primary:9000",
+            "defaultRegion": "us-east-1"
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        assert!(cfg.oss_config.fallback.is_none());
+        validate_global_config(&cfg).expect("no fallback should validate");
+    }
+
+    #[test]
+    fn test_oss_config_fallback_requires_endpoint() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "http://primary:9000",
+            "defaultRegion": "us-east-1",
+            "fallback": { "region": "us-east-1" }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        let err = validate_global_config(&cfg).expect_err("fallback endpoint is required");
+        assert!(err.to_string().contains("fallback.endpoint"));
+    }
+
+    #[test]
+    fn test_oss_config_fallback_allows_prefix_prepend_without_primary_prefix() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "http://primary:9000",
+            "defaultRegion": "us-east-1",
+            "fallback": {
+              "endpoint": "http://mirror:9000",
+              "region": "us-east-1",
+              "keyPrefix": "replica"
+            }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        validate_global_config(&cfg).expect("prefix prepend should validate");
+    }
+
+    #[test]
+    fn test_oss_config_fallback_rejects_mixed_credentials() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "http://primary:9000",
+            "defaultRegion": "us-east-1",
+            "fallback": {
+              "endpoint": "http://mirror:9000",
+              "region": "us-east-1",
+              "credentialProcess": "echo '{}'",
+              "accessKeyId": "ak",
+              "secretAccessKey": "sk"
+            }
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        let err = validate_global_config(&cfg).expect_err("mixed fallback credentials");
+        assert!(err.to_string().contains("fallback.credentialProcess"));
     }
 
     #[test]

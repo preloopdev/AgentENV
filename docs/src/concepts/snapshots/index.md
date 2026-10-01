@@ -23,6 +23,28 @@ A snapshot preserves:
 - CPU, memory, and disk settings, together with command context such as
   environment variables, working directory, user, and startup commands.
 
+## Storage Backends
+
+`snapshot.repository_backend` selects where committed snapshots live:
+
+- `posix_fs` — a shared filesystem.
+- `oss` — an S3-compatible object store (for example Alibaba OSS, MinIO, or a
+  site-local RustFS). The `[backend.oss]` section configures the endpoint,
+  bucket, prefix, region, and credentials.
+
+An `oss` backend may declare an optional read-only mirror in
+`[backend.oss.fallback]`. The mirror is expected to hold the same keys, for
+example through asynchronous bucket replication from a site-local primary to a
+durable remote service. When the primary is unreachable, reads (including
+metadata, catalogs, and managed layer blobs) are served from the mirror so a
+node can keep starting and resuming sandboxes read-only; writes and deletes
+always go to the primary. Immutable content-addressed layer blobs may also fall
+back to the mirror when the primary does not have them, while mutable records
+(snapshot records, volume records, aliases, and heads) never do, so a stale
+mirror cannot resurrect deleted state. See
+[`[backend.oss]`](../configuration/reference.md#backendoss) in the
+configuration reference for the full semantics and configuration keys.
+
 ---
 
 Where to Go Next:
