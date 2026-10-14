@@ -39,20 +39,29 @@ The target is the `linux-azure 6.17.0-1020.20~24.04.1` kernel from the `ubuntu-2
 
 ### Build inputs
 
-These files live under `kernel/`. A separate change adds them, so this page names them without linking.
+These files live under `kernel/` and come from [preloopdev/AgentENV#3](https://github.com/preloopdev/AgentENV/pull/3). This page names them without linking to the files themselves.
 
 | Path | Role |
 |---|---|
-| `kernel/configs/upstream-x86_64-6.1.175.config` | Config of the upstream kvcache-ai `vmlinux-6.1.175`. Provenance only; the build does not read it. |
 | `kernel/configs/preloop-x86_64-6.1.175.defconfig` | `make savedefconfig` output of the final preloop3 config. Reproduce it with `cp <defconfig> .config && make olddefconfig`. |
 | `kernel/configs/preloop-x86_64-6.1.fragment` | Parity delta: 45 options, the tiers below, `CONFIG_LSM`, and local version `-preloop3`. It is series-independent. |
-| `kernel/configs/preloop-base-x86_64.fragment` | Preloop additions over upstream 6.1.175, such as nested KVM, netfilter/nftables, bridge, device-mapper, btrfs, DAMON reclaim, and virtio-fs and vsock. Merged only when porting to a new base. |
+| `kernel/configs/preloop-base-x86_64.fragment` | Settings the preloop2 build changed relative to the 6.1.175 config it was derived from (provenance unrecorded): nested KVM, netfilter/nftables, bridge, device-mapper, btrfs, DAMON reclaim/LRU sort, virtio-fs/vsock, and others. Merged only when porting to a new base. |
 | `kernel/patches/6.1/0001-apparmor-restrict-unprivileged-userns-sysctl-shim.patch` | Adds the opt-in `CONFIG_USERNS_APPARMOR_SYSCTL_COMPAT` option and `kernel/userns_apparmor_compat.c`, the sysctl shim. |
-| `kernel/build.sh` | Takes one argument, a full version (default `6.1.175`). It derives the series, applies `kernel/patches/<series>/*.patch`, runs `olddefconfig` from `configs/preloop-x86_64-<version>.defconfig`, checks every line of `configs/preloop-x86_64-<series>.fragment` against the final `.config`, builds `vmlinux`, and writes `vmlinux.bin`. |
+| `kernel/build.sh` | Takes one argument, a full version (default `6.1.175`). It derives the series, applies `kernel/patches/<series>/*.patch`, runs `olddefconfig` from `configs/preloop-x86_64-<version>.defconfig`, checks every line of `configs/preloop-x86_64-<series>.fragment` against the final `.config`, builds `vmlinux`, and writes `vmlinux.bin` and `vmlinux.bin.sha256`. |
+| `kernel/smoke-test.sh` | Boots a built kernel under a Firecracker binary with a busybox initramfs and runs the parity checks listed in the [verification checklist](#verification-checklist). |
 
-Build prerequisites are `flex`, `bison`, `bc`, and `pahole` 1.22 or newer. `build.sh` writes `vmlinux.bin` with `objcopy --strip-debug`, which keeps the `.BTF` section.
+Build prerequisites are `curl`, `xz`, `gcc`, `make`, `flex`, `bison`, `bc`, `libelf-dev`, `libssl-dev`, and `pahole` 1.22 or newer. `build.sh` writes `vmlinux.bin` with `objcopy --strip-debug`, which keeps the `.BTF` section, and it fails if the result has no `.BTF` section. After that step, `readelf -S vmlinux.bin` shows `.BTF` and `.BTF_ids`.
 
-The upstream `vmlinux-6.1.175` has no BTF section and no embedded config, so the preloop build differs from it. Keep the defconfig and fragments in the repository as the record of what was built.
+The provenance of the 6.1.175 config that the preloop2 build was derived from is not recorded. That starting config is neither Firecracker's microvm-kernel-ci 6.1 config nor the config of kvcache-ai's published `vmlinux-6.1.175`. The defconfig and fragments in this repository are therefore the record of what was built. The preloop3 defconfig enables `CONFIG_IKCONFIG` and `CONFIG_IKCONFIG_PROC`, so a booted build can expose its own `.config` at `/proc/config.gz`. Do not treat any other file as the upstream baseline.
+
+### Reference build
+
+The current preloop3 artifact:
+
+- Kernel release: `6.1.175-preloop3`.
+- `vmlinux.bin`: 86,523,640 bytes, sha256 `1a36f2bb308ed689d109641a27534c55fc3dd6b8ecd726b6f34642e7114da91d`.
+- Source: the kernel.org 6.1.175 tarball, sha256 `37e984a9…beca85`, which matches kernel.org's `sha256sums.asc`.
+- Boot: about 1.7 s under Firecracker v1.15.1-patch-v1 with 2 vCPUs and 2 GiB of memory.
 
 ### What the parity delta changes
 
@@ -68,7 +77,7 @@ Building an LSM is not enough. An LSM takes effect only when it is built in and 
 CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor,bpf"
 ```
 
-Without `yama` and `landlock` in that list, `SECURITY_YAMA` and `SECURITY_LANDLOCK` are inert. `SECURITY_SAFESETID` is built but not listed, so it is inert too. The kernel skips listed names that are not built in (`security/security.c`). The `apparmor` entry has no effect in these builds, because the shim requires `SECURITY_APPARMOR` to be off. The list is linux-azure's list plus `bpf`.
+Without `yama` and `landlock` in that list, `SECURITY_YAMA` and `SECURITY_LANDLOCK` are inert. `SECURITY_SAFESETID` is built but not listed, so it is inert too. The kernel skips listed names that are not built in (`security/security.c`). The `apparmor` entry has no effect in these builds, because the shim requires `SECURITY_APPARMOR` to be off. The list is linux-azure's list plus `bpf`. On the preloop3 build, `/sys/kernel/security/lsm` reads `capability,landlock,yama,bpf`, so `apparmor`, `lockdown`, and `integrity` are not active.
 
 #### The sysctl shim
 
@@ -82,6 +91,10 @@ Without `yama` and `landlock` in that list, `SECURITY_YAMA` and `SECURITY_LANDLO
 
 Kconfig does not error when a requested option's dependencies are unmet. The option is simply absent or unset in the final `.config`. On 6.1, all 45 requested options were honoured, and Kconfig auto-enabled 11 dependencies that the fragment does not list. `scripts/kconfig/merge_config.sh` runs its comparison only when it runs `make` itself. With `-m`, which the 6.18 port uses, run the check in the [Verification checklist](#verification-checklist) after `make olddefconfig`.
 
+### Known limitation: ntfs3 writes
+
+On 6.1.175 the `ntfs3` driver mounts NTFS volumes, but it cannot create files on a freshly `mkntfs`-formatted volume. The kernel logs `ntfs3: loop0: no free space to extend mft`, for both quick and full formats. This is a limitation of the 6.1 driver, not of the configuration. Whether linux-azure 6.17 can write to such a volume is unverified. The smoke test checks only that `ntfs3` is registered. This is one reason to do the 6.18 port.
+
 ## Upgrading to the 6.18 LTS
 
 Firecracker's [kernel policy](https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md) sets the minimum Firecracker version and the minimum end-of-support date for each guest kernel:
@@ -94,7 +107,7 @@ Firecracker's [kernel policy](https://github.com/firecracker-microvm/firecracker
 ### Prerequisites
 
 1. **Firecracker v1.16.1 or later.** The pinned `1.15.1-patch-v1` is below the 6.18 minimum. The kvcache-ai/firecracker releases are `v1.15.1-patch-v2` and `aenv-deps`, with no 1.16+ build. Upstream Firecracker has v1.16.1 (2026-07-02), v1.16.2, and v1.17.0 (both 2026-09-10). Package the binary and update `config/deps_manifest.toml` as described in the [Firecracker Client and Runtime Upgrade Checklist](../internals/sandbox-testing.md#41-firecracker-client-and-runtime-upgrade-checklist). To test without changing the manifest, set `[firecracker] binary_path`.
-2. **Base config.** Start from the kernel.org 6.18.z tarball and Firecracker's `resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config`. That file is generated from an Amazon Linux microVM kernel (`6.18.39-…amzn2023.x86_64.microvm`). Firecracker's policy says the configs are for its Amazon Linux microVM kernels and that upstream builds are not guaranteed to work with them. Expect fixups, and run the option check. The CI config leaves `CONFIG_BTRFS_FS` and `CONFIG_VIRTIO_FS` unset, both preloop additions, so merge the base fragment or those options are lost.
+2. **Base config.** Start from the kernel.org 6.18.z tarball and Firecracker's `resources/guest_configs/microvm-kernel-ci-x86_64-6.18.config`. That file is generated from an Amazon Linux microVM kernel (`6.18.39-…amzn2023.x86_64.microvm`). Firecracker's policy says the configs are for its Amazon Linux microVM kernels and that upstream builds are not guaranteed to work with them. Expect fixups, and run the option check. The CI config leaves `CONFIG_BTRFS_FS` and `CONFIG_VIRTIO_FS` unset, both settings the preloop2 build changed, so merge the base fragment or those settings are lost.
 3. **Host kernel (issue #20).** The ublk daemon runs on the host, so the host kernel matters even though the guest does not run ublk. [kvcache-ai/AgentENV#20](https://github.com/kvcache-ai/AgentENV/issues/20) reports that the first `UBLK_U_CMD_ADD_DEV` can trigger a NULL-pointer dereference on a host kernel that has upstream commit `529d4d632788` (ublk NUMA-aware allocation) without its prerequisite `011af85ccd87` (tag_set reorder). The command then never completes, and AgentENV cannot create sandboxes. Reported affected kernels: upstream 6.18.4 and 6.18.5, Arch `6.18.4-arch1-1`, and Ubuntu `6.17.0-1015-azure` and `6.17.0-1018-azure`. Upstream 6.18.6 and later 6.18.y releases contain the fix. The 6.18 guest config leaves `CONFIG_BLK_DEV_UBLK` unset.
 
 ### Port the series
@@ -108,7 +121,7 @@ Run these steps once. Afterward, `kernel/build.sh 6.18.<z>` works unchanged.
    Also confirm that its dependencies still hold: `USER_NS` and `SYSCTL` enabled, and `SECURITY_APPARMOR` disabled, as in the CI config.
 2. **Extract and patch.** Extract the 6.18.z tarball and apply `kernel/patches/6.18/*.patch` in order.
 3. **Set the base config.** Copy the Firecracker CI config to `.config`.
-4. **Merge both fragments.** The base fragment carries the preloop additions, and the parity fragment carries the runner-parity delta:
+4. **Merge both fragments.** The base fragment carries the settings the preloop2 build changed, and the parity fragment carries the runner-parity delta:
 
    ```bash
    scripts/kconfig/merge_config.sh -m .config \
@@ -117,16 +130,27 @@ Run these steps once. Afterward, `kernel/build.sh 6.18.<z>` works unchanged.
    make olddefconfig
    ```
 
-   Then run the option check from the [Verification checklist](#verification-checklist) against both fragments. The base fragment carries the DAMON reclaim option, so confirm `CONFIG_DAMON_RECLAIM=y` in the final `.config`. The shipped boot args depend on it (`config/default.toml`, and `DEFAULT_BOOT_ARGS` in `src/sandbox/firecracker/config.rs`), and without it the `damon_reclaim.*` parameters do nothing. The shipped `config/default.toml` line also passes `mitigations=off`, which `DEFAULT_BOOT_ARGS` does not.
-5. **Build and check BTF.** Build `vmlinux` and write `vmlinux.bin` with `objcopy --strip-debug`, the same steps `kernel/build.sh` runs. Confirm the BTF section is present with `readelf -S vmlinux.bin | grep -w .BTF`. [INFERENCE: this command was not run here.]
+   Then run the option check from the [Verification checklist](#verification-checklist) against both fragments. Confirm `CONFIG_DAMON_RECLAIM=y` in the final `.config`. The shipped boot args set `damon_reclaim.*` parameters (`config/default.toml`, and `DEFAULT_BOOT_ARGS` in `src/sandbox/firecracker/config.rs`); without the option, no `damon_reclaim` module receives them. DAMON reclaim is compiled into the upstream 6.1.175 binary too, so the option is not specific to the preloop build. Under Firecracker v1.15.1-patch-v1, both that binary and preloop3 read `Y` from `/sys/module/damon_reclaim/parameters/enabled` when `damon_reclaim.enabled=Y` is on the command line. The shipped `config/default.toml` line also passes `mitigations=off`, which `DEFAULT_BOOT_ARGS` does not.
+5. **Build and check BTF.** Build `vmlinux` and write `vmlinux.bin` with `objcopy --strip-debug`, the same steps `kernel/build.sh` runs. `readelf -S vmlinux.bin` shows `.BTF` and `.BTF_ids`.
 6. **Commit the inputs.** Run `make savedefconfig` and commit the result as `kernel/configs/preloop-x86_64-6.18.<z>.defconfig`. Commit the 6.18 patches and a copy of the parity fragment as `kernel/configs/preloop-x86_64-6.18.fragment`, which `kernel/build.sh` checks for that series.
 7. **Install and switch.** Continue with [Install the new kernel next to the old one](#install-the-new-kernel-next-to-the-old-one).
 
 ### Verification checklist
 
-Check 1 runs in the kernel tree. Checks 7 and 9 run on the host. Checks 2, 3, 5, and 6 run in the golden, which is read-only. Check 4 writes a sysctl, so run it in a throwaway sandbox, because anything changed in the golden is captured in its snapshot. Check 8 runs in a clone of the new golden.
+Check 1 needs a host with `/dev/kvm` and no sandbox. Check 2 runs in the kernel tree. Checks 8 and 10 run on the host. Checks 3, 4, 6, and 7 run in the golden, which is read-only. Check 5 writes a sysctl, so run it in a throwaway sandbox, because anything changed in the golden is captured in its snapshot. Check 9 runs in a clone of the new golden.
 
-1. **Options.** Every requested fragment line appears unchanged in the final `.config`:
+1. **Automated smoke test.** Run `kernel/smoke-test.sh <vmlinux.bin> <firecracker>`. It boots the kernel under the given Firecracker binary with a busybox initramfs and runs 24 checks:
+   - `kernel.apparmor_restrict_unprivileged_userns` defaults to 0, accepts writes of 1 and 0, and rejects 2 without changing its value.
+   - `kernel.yama.ptrace_scope` is 1.
+   - A process running as uid 1001 can create a user namespace.
+   - Loop-mount and write succeed on minix, vfat, exfat, and btrfs.
+   - ntfs3, udf, erofs, f2fs, hfs, hfsplus, jfs, nilfs2, zonefs, 9p, nfsd, overlay, and fuse are registered as filesystems.
+   - `/proc/net/unix` exists (the script names this check `unix_diag`).
+
+   The script also prints `uname -r`, the active LSM list, and the `damon_reclaim` parameter as information lines. It exits non-zero if any check fails.
+
+   The host needs `/dev/kvm`, a static busybox (given by `BUSYBOX`, or found on `PATH`), gzip, and `mkfs.minix`, `mkfs.vfat`, `mkfs.exfat`, and `mkfs.btrfs`. Reported results: preloop3 passes 24 and fails 0; the upstream 6.1.175 binary passes 4 and fails 20. These results come from the kernel build runs, not from this page's checks.
+2. **Options.** Every requested fragment line appears unchanged in the final `.config`:
 
    ```bash
    AGENTENV=/path/to/AgentENV
@@ -140,14 +164,14 @@ Check 1 runs in the kernel tree. Checks 7 and 9 run on the host. Checks 2, 3, 5,
    ```
 
    For a 6.1 build, check only `preloop-x86_64-6.1.fragment`, because the base fragment is for ports to a new base. Any `not honoured` line blocks the build. Dependencies that Kconfig enables on its own do not appear in the fragments and are expected.
-2. **Local version.** `uname -r` ends with the fragment's local version (`-preloop3` on the 6.1 build). Use this, not the snapshot record, to identify the running kernel.
-3. **LSMs.** `cat /sys/kernel/security/lsm` lists `landlock` and `yama`. [INFERENCE: securityfs path; not run here.] If one is missing, add `lsm.debug` to the boot arguments, boot once, and run `dmesg | grep 'not built'`. The kernel logs listed names that are not built in.
-4. **Sysctl.** `sysctl kernel.apparmor_restrict_unprivileged_userns` exists. `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` succeeds and reads back `0`. Writing `1` also succeeds.
-5. **Yama.** `sysctl kernel.yama.ptrace_scope` exists.
-6. **DAMON reclaim.** `/proc/cmdline` contains `damon_reclaim.enabled=Y`, and `/sys/module/damon_reclaim/parameters/enabled` reads `Y`. [INFERENCE: parameter path not run here.]
-7. **Cold start.** `aenv start --cold <base image>` reaches the ready state.
-8. **Known-failing workflow.** In a clone of the new golden, run the workflow that motivated the parity delta, such as the `uv` `test.yml` job that loop-mounts a MINIX image. It must pass.
-9. **Sandbox checklist.** Run the [end-to-end execution checklist](../internals/sandbox-testing.md#4-end-to-end-execution-checklist).
+3. **Local version.** `uname -r` ends with the fragment's local version (`-preloop3` on the 6.1 build). Use this, not the snapshot record, to identify the running kernel.
+4. **LSMs.** With securityfs mounted at `/sys/kernel/security`, `cat /sys/kernel/security/lsm` reads `capability,landlock,yama,bpf` on preloop3. The upstream 6.1.175 binary reads `capability,selinux`, because upstream activates SELinux and Ubuntu does not. If an expected LSM is missing, add `lsm.debug` to the boot arguments, boot once, and run `dmesg | grep 'not built'`. The kernel logs listed names that are not built in.
+5. **Sysctl.** `sysctl kernel.apparmor_restrict_unprivileged_userns` exists. `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` succeeds and reads back `0`. Writing `1` also succeeds, and writing `2` is rejected.
+6. **Yama.** `sysctl kernel.yama.ptrace_scope` exists.
+7. **DAMON reclaim.** `/proc/cmdline` contains `damon_reclaim.enabled=Y`, and `/sys/module/damon_reclaim/parameters/enabled` reads `Y`. Under Firecracker v1.15.1-patch-v1, both preloop3 and the upstream 6.1.175 binary read `Y`.
+8. **Cold start.** `aenv start --cold <base image>` reaches the ready state.
+9. **Known-failing workflow.** In a clone of the new golden, run the workflow that motivated the parity delta, such as the `uv` `test.yml` job that loop-mounts a MINIX image. It must pass.
+10. **Sandbox checklist.** Run the [end-to-end execution checklist](../internals/sandbox-testing.md#4-end-to-end-execution-checklist).
 
 ## Rebuilding and publishing the golden
 
@@ -180,10 +204,10 @@ To roll back, revert the kernel override (or set `[kernel] version` back to `vml
 Publishing goes to the backend selected by `[snapshot] repository_backend`. For R2, set it to `oss` and configure [`[backend.oss]`](../configuration/reference.md#backendoss) with the R2 `endpoint`, `bucket`, `region`, and credentials. R2 is S3-compatible, and some R2 deployments need `addressing_style = "virtual"`. [INFERENCE: R2's region value is `auto`, from Cloudflare's documentation; not checked here.] Keep `[snapshot.publish_compression]` unchanged from the previous publish, because it changes uploaded digests (see the table below). Leave `[snapshot.image_publish]` disabled. This page does not cover source-registry publishing.
 
 1. Cold-start from the same base image reference the old golden used, for example `aenv start --cold ubuntu:24.04`. `--cold` takes an OCI image, not a template or snapshot ID ([`aenv start`](../getting-started/aenv-cli/sandboxes.md)). A moved tag changes the base layers, which then upload again.
-2. Wait until the sandbox is ready. Run checks 2, 3, 5, and 6 from the [Verification checklist](#verification-checklist) in the golden. Run check 4 in a throwaway sandbox.
+2. Wait until the sandbox is ready. Run checks 3, 4, 6, and 7 from the [Verification checklist](#verification-checklist) in the golden. Run check 5 in a throwaway sandbox.
 3. Capture and publish: `aenv snapshot create <golden-sandbox-id> --name <new-alias>`. The golden keeps running. The command publishes the snapshot to the configured repository before it returns ([Create a Snapshot](../concepts/snapshots/create.md)).
 4. Confirm that the alias resolves: `curl -H 'X-API-Key: <key>' http://127.0.0.1:8000/snapshots/<new-alias>` ([Manage Snapshots](../concepts/snapshots/manage.md)).
-5. Start a clone with `aenv start <new-alias>`, and run check 8 there.
+5. Start a clone with `aenv start <new-alias>`, and run check 9 there.
 
 ### What is uploaded and what is reused
 
