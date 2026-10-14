@@ -1,0 +1,68 @@
+# GitHub-hosted runner parity for the AgentENV Firecracker guest kernel.
+#
+# Parity target: Ubuntu linux-azure 6.17.0-1020 (runner image ubuntu-24.04
+# 20260720.247.2). Merge on top of the preloop base config with
+#   scripts/kconfig/merge_config.sh -m .config preloop-x86_64-6.1.fragment
+# then `make olddefconfig`. Everything is built in (=y): the runner rootfs
+# only ships modules for the azure kernel, never for this one.
+
+CONFIG_LOCALVERSION="-preloop3"
+
+# --- Tier 1: observed workflow failures -------------------------------------
+# prettier prod-test.yml writes 0 here before Chromium; the image's
+# /etc/sysctl.d/10-apparmor.conf sets it too. Ubuntu-only sysctl; see
+# kernel/patches/6.1/0001-apparmor-restrict-unprivileged-userns-sysctl-shim.patch
+CONFIG_USERNS_APPARMOR_SYSCTL_COMPAT=y
+# uv test.yml: mkfs.minix + mount -o loop (low hardlink limit tests).
+CONFIG_MINIX_FS=y
+
+# --- Tier 2: sysctls the runner image configures ----------------------------
+# /etc/sysctl.d/10-ptrace.conf sets kernel.yama.ptrace_scope.
+CONFIG_SECURITY_YAMA=y
+# Ubuntu's boot-time LSM order (azure CONFIG_LSM), plus bpf because this
+# kernel builds BPF_LSM. Inactive entries (apparmor) are ignored.
+CONFIG_SECURITY_LANDLOCK=y
+CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor,bpf"
+
+# --- Tier 3: filesystems and interfaces Ubuntu ships -------------------------
+CONFIG_FAT_FS=y
+CONFIG_MSDOS_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_FAT_DEFAULT_CODEPAGE=437
+CONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1"
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_ASCII=y
+CONFIG_NLS_UTF8=y
+CONFIG_EXFAT_FS=y
+CONFIG_NTFS3_FS=y
+CONFIG_UDF_FS=y
+CONFIG_EROFS_FS=y
+CONFIG_F2FS_FS=y
+CONFIG_HFS_FS=y
+CONFIG_HFSPLUS_FS=y
+CONFIG_JFS_FS=y
+CONFIG_NILFS2_FS=y
+CONFIG_BLK_DEV_ZONED=y
+CONFIG_ZONEFS_FS=y
+CONFIG_NET_9P=y
+CONFIG_NET_9P_FD=y
+CONFIG_NET_9P_VIRTIO=y
+CONFIG_9P_FS=y
+CONFIG_NFSD=y
+CONFIG_NFSD_V4=y
+CONFIG_BLK_DEV_RAM=y
+CONFIG_BLK_DEV_RAM_COUNT=16
+CONFIG_BLK_DEV_RAM_SIZE=65536
+# ss -x / ss -0 / ss -f netlink
+CONFIG_UNIX_DIAG=y
+CONFIG_PACKET_DIAG=y
+CONFIG_NETLINK_DIAG=y
+# AF_ALG userspace crypto (kcapi, cryptsetup benchmarks)
+CONFIG_CRYPTO_USER_API_HASH=y
+CONFIG_CRYPTO_USER_API_SKCIPHER=y
+CONFIG_CRYPTO_USER_API_AEAD=y
+CONFIG_CRYPTO_USER_API_RNG=y
+CONFIG_SECURITY_SAFESETID=y
+CONFIG_INPUT_MISC=y
+CONFIG_INPUT_UINPUT=y

@@ -1,0 +1,82 @@
+From: preloop <noreply@preloop.dev>
+Subject: [PATCH] userns: add kernel.apparmor_restrict_unprivileged_userns compat sysctl
+
+Ubuntu kernels add this sysctl through an out-of-tree AppArmor patch and
+GitHub-hosted runner images and workflows depend on it. Provide an opt-in,
+non-enforcing knob for kernels built without AppArmor.
+---
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1257,6 +1257,20 @@
+ 
+ 	  If unsure, say N.
+ 
++config USERNS_APPARMOR_SYSCTL_COMPAT
++	bool "Ubuntu-compatible kernel.apparmor_restrict_unprivileged_userns sysctl"
++	depends on USER_NS && SYSCTL && !SECURITY_APPARMOR
++	help
++	  Provide the kernel.apparmor_restrict_unprivileged_userns sysctl
++	  that Ubuntu kernels add through an out-of-tree AppArmor patch.
++	  Ubuntu userspace and GitHub Actions workflows write it before
++	  launching sandboxed browsers and fail when it is absent.
++
++	  The knob stores 0 or 1 and enforces nothing: without AppArmor,
++	  unprivileged user namespaces are not restricted by it.
++
++	  If unsure, say N.
++
+ config PID_NS
+ 	bool "PID Namespaces"
+ 	default y
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -77,6 +77,7 @@
+ obj-$(CONFIG_CGROUPS) += cgroup/
+ obj-$(CONFIG_UTS_NS) += utsname.o
+ obj-$(CONFIG_USER_NS) += user_namespace.o
++obj-$(CONFIG_USERNS_APPARMOR_SYSCTL_COMPAT) += userns_apparmor_compat.o
+ obj-$(CONFIG_PID_NS) += pid_namespace.o
+ obj-$(CONFIG_IKCONFIG) += configs.o
+ obj-$(CONFIG_IKHEADERS) += kheaders.o
+--- a/kernel/userns_apparmor_compat.c
++++ b/kernel/userns_apparmor_compat.c
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel.apparmor_restrict_unprivileged_userns compatibility knob.
++ *
++ * Ubuntu kernels carry an out-of-tree AppArmor patch that adds this sysctl.
++ * GitHub-hosted runner images set it in /etc/sysctl.d/10-apparmor.conf, and
++ * workflows write 0 to it before starting Chromium, whose sandbox needs
++ * unprivileged user namespaces. Mainline has no such sysctl, so on a kernel
++ * without that patch those writes fail with ENOENT and the step fails.
++ *
++ * This option is only available without AppArmor, where nothing restricts
++ * unprivileged user namespaces in the first place. The knob accepts and
++ * reports 0 or 1 so images and workflows written for Ubuntu behave the same,
++ * and it enforces nothing.
++ */
++#include <linux/init.h>
++#include <linux/sysctl.h>
++
++static int apparmor_restrict_unprivileged_userns;
++
++static struct ctl_table userns_apparmor_compat_table[] = {
++	{
++		.procname	= "apparmor_restrict_unprivileged_userns",
++		.data		= &apparmor_restrict_unprivileged_userns,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{ }
++};
++
++static int __init userns_apparmor_compat_init(void)
++{
++	register_sysctl_init("kernel", userns_apparmor_compat_table);
++	return 0;
++}
++late_initcall(userns_apparmor_compat_init);
